@@ -7,7 +7,7 @@ export function registerContentTools(server: McpServer, client: KhanClient) {
   // ─── get_content ─────────────────────────────────────────────────
   server.tool(
     "get_content",
-    "Get details about a specific Khan Academy content item (video, article, or exercise). Accepts a slug or full URL. Returns title, description, type, and metadata.",
+    "Get detailed information about a Khan Academy content item (video, article, or exercise). Returns title, description, type, URL, duration, author, and video chapters. Accepts a slug or full URL.",
     {
       slug: z
         .string()
@@ -15,6 +15,7 @@ export function registerContentTools(server: McpServer, client: KhanClient) {
           "Content slug or full URL (e.g., 'math/algebra/v/intro-to-algebra', 'https://www.khanacademy.org/science/biology/a/intro-to-biology')"
         ),
     },
+    { title: "Get Content Details", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     async ({ slug }) => {
       try {
         const content = await client.getContent(slug);
@@ -55,6 +56,13 @@ export function registerContentTools(server: McpServer, client: KhanClient) {
           text += `**Date Added:** ${content.dateAdded}\n`;
         }
 
+        if (content.keyMoments?.length) {
+          text += `\n### Key Moments (Chapters)\n`;
+          for (const km of content.keyMoments) {
+            text += `- [${formatDuration(km.startOffset)}] ${km.label}\n`;
+          }
+        }
+
         return {
           content: [{ type: "text" as const, text }],
         };
@@ -75,7 +83,7 @@ export function registerContentTools(server: McpServer, client: KhanClient) {
   // ─── get_course ──────────────────────────────────────────────────
   server.tool(
     "get_course",
-    "Get the full structure of a Khan Academy course, including units, lessons, and content items. Use `list_subjects` or `search` to find course slugs.",
+    "Get the full structure of a Khan Academy course — all units, lessons, and content items. Returns the complete course outline. Accepts a course slug or URL (e.g. 'math/algebra').",
     {
       slug: z
         .string()
@@ -83,6 +91,7 @@ export function registerContentTools(server: McpServer, client: KhanClient) {
           "Course slug or URL (e.g., 'math/algebra', 'science/ap-biology', 'computing/computer-programming')"
         ),
     },
+    { title: "Get Course Structure", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     async ({ slug }) => {
       try {
         const course = await client.getCourse(slug);

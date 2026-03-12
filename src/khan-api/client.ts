@@ -11,6 +11,11 @@ import {
   KhanSearchResult,
   KhanContentSummary,
   ContentKind,
+  KhanArticle,
+  KhanLessonDetail,
+  KhanKeyMoment,
+  KhanExercise,
+  KhanQuiz,
 } from "./types.js";
 import { normalizeSlug, buildKAUrl, detectContentKind, extractYouTubeId } from "./parser.js";
 
@@ -364,6 +369,7 @@ export class KhanClient {
     const cached = this.cache.get<KhanSearchResult[]>(cacheKey);
     if (cached) return cached;
 
+    // Primary: GraphQL search API
     try {
       const data = await this.graphql<SearchPageResponse>("getContentSearchResults", {
         query,
@@ -371,20 +377,20 @@ export class KhanClient {
       });
 
       if (data?.searchPage?.results?.length) {
-        const results: KhanSearchResult[] = data.searchPage.results.map((r) => {
-          const lc = r.learnableContent ?? {};
-          const parentPath = this.buildParentPath(lc.parentTopic);
-          return {
-            title: lc.translatedTitle ?? "",
-            description: lc.translatedDescription ?? "",
-            kind: (r.kind as ContentKind) ?? "Unknown",
-            url: parentPath
-              ? `https://www.khanacademy.org/search?search_query=${encodeURIComponent(query)}`
-              : `https://www.khanacademy.org/search?search_query=${encodeURIComponent(query)}`,
-            slug: "",
-            parentPath,
-          };
-        });
+        const results: KhanSearchResult[] = data.searchPage.results
+          .filter((r) => r.learnableContent?.translatedTitle)
+          .map((r) => {
+            const lc = r.learnableContent!;
+            const parentPath = this.buildParentPath(lc.parentTopic);
+            return {
+              title: lc.translatedTitle ?? "",
+              description: lc.translatedDescription ?? "",
+              kind: (r.kind as ContentKind) ?? "Unknown",
+              url: "",
+              slug: "",
+              parentPath,
+            };
+          });
         this.cache.set(cacheKey, results, CACHE_TTL);
         return results;
       }
@@ -480,6 +486,7 @@ export class KhanClient {
           authorNames: raw.authorNames,
           dateAdded: raw.dateAdded,
           kaUrl: raw.kaUrl ?? buildKAUrl(raw.relativeUrl ?? slug),
+          keyMoments: raw.keyMoments,
         };
         this.cache.set(cacheKey, content, CACHE_TTL);
         return content;
@@ -638,6 +645,498 @@ export class KhanClient {
     } catch {
       return null;
     }
+  }
+
+  // ─── get_article ─────────────────────────────────────────────────
+
+  async getArticle(slugOrUrl: string): Promise<KhanArticle | null> {
+    const slug = normalizeSlug(slugOrUrl);
+    const cacheKey = `article:${slug}`;
+    const cached = this.cache.get<KhanArticle>(cacheKey);
+    if (cached) return cached;
+
+    try {
+      // Get metadata via ContentForPath
+      const result = await this.contentForPath(slug);
+      const raw = result?.content;
+
+      // Verify it's an article
+      if (!raw || !raw.contentKind?.toLowerCase().includes("article")) {
+        // If not clearly an article, still attempt if slug contains /a/
+        if (!slug.includes("/a/") && !slug.includes("/article/")) {
+          return null;
+        }
+      }
+
+      const title = raw?.translatedTitle ?? slug;
+      const description = raw?.translatedDescription ?? raw?.description ?? "";
+      const authorNames = raw?.authorNames;
+      const dateAdded = raw?.dateAdded;
+      const url = buildKAUrl(raw?.relativeUrl ?? slug);
+
+      // Scrape the page for article content
+      let content = "";
+      try {
+        const response = await this.rateLimitedFetch(`https://www.khanacademy.org/${slug}`, {
+          headers: { Accept: "text/html" },
+        });
+
+        if (response.ok) {
+          const html = await response.text();
+          content = this.extractArticleContent(html);
+        }
+      } catch {
+        // Continue with empty content
+      }
+
+      if (!content && !raw) {
+        return null;
+      }
+
+      const article: KhanArticle = {
+        slug,
+        title,
+        description,
+        url,
+        content: content || description,
+        authorNames,
+        dateAdded,
+      };
+
+      this.cache.set(cacheKey, article, CACHE_TTL);
+      return article;
+    } catch {
+      return null;
+    }
+  }
+
+  private extractArticleContent(html: string): string {
+    // Try extracting from Apollo state
+    const stateMatch = html.match(/window\.__APOLLO_STATE__\s*=\s*({.+?});?\s*<\/script>/s);
+    if (stateMatch) {
+      try {
+        const state = JSON.parse(stateMatch[1]);
+        for (const [_, value] of Object.entries(state)) {
+          const v = value as Record<string, unknown>;
+
+          // Look for Perseus content (article content stored as JSON)
+          const perseusContent = v.perseusContent ?? v.articleContent;
+          if (typeof perseusContent === "string" && perseusContent.length > 0) {
+            try {
+              const parsed = JSON.parse(perseusContent);
+              if (parsed.content && typeof parsed.content === "string") {
+                return this.stripHtmlAndClean(parsed.content);
+              }
+              // Some Perseus content has items array
+              if (Array.isArray(parsed.items)) {
+                return parsed.items
+                  .map((item: Record<string, unknown>) => {
+                    const nested = item.item as Record<string, unknown> | undefined;
+                    const itemContent = item.content ?? nested?.content;
+                    return typeof itemContent === "string" ? this.stripHtmlAndClean(itemContent) : "";
+                  })
+                  .filter(Boolean)
+                  .join("\n\n");
+              }
+            } catch {
+              // Not JSON, use as-is
+              return this.stripHtmlAndClean(perseusContent);
+            }
+          }
+        }
+      } catch {
+        // Fall through to other extraction methods
+      }
+    }
+
+    // Fallback: extract from clearfix div or article tags
+    const clearfixMatch = html.match(/<div\s+class="clearfix"[^>]*>([\s\S]*?)<\/div>\s*<\/div>/);
+    if (clearfixMatch) {
+      return this.stripHtmlAndClean(clearfixMatch[1]);
+    }
+
+    const articleMatch = html.match(/<article[^>]*>([\s\S]*?)<\/article>/);
+    if (articleMatch) {
+      return this.stripHtmlAndClean(articleMatch[1]);
+    }
+
+    return "";
+  }
+
+  private stripHtmlAndClean(html: string): string {
+    return html
+      .replace(/<br\s*\/?>/gi, "\n")
+      .replace(/<\/p>/gi, "\n\n")
+      .replace(/<\/div>/gi, "\n")
+      .replace(/<\/h[1-6]>/gi, "\n\n")
+      .replace(/<[^>]+>/g, "")
+      .replace(/&amp;/g, "&")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&apos;/g, "'")
+      .replace(/&nbsp;/g, " ")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+  }
+
+  // ─── get_lesson ─────────────────────────────────────────────────
+
+  async getLesson(slugOrUrl: string): Promise<KhanLessonDetail | null> {
+    const slug = normalizeSlug(slugOrUrl);
+    const cacheKey = `lesson:${slug}`;
+    const cached = this.cache.get<KhanLessonDetail>(cacheKey);
+    if (cached) return cached;
+
+    try {
+      // Strategy: extract course slug from lesson path, fetch course, find lesson
+      // Lesson slugs look like: math/algebra/x2f8bb11595b61c86:foundation-algebra/x2f8bb11595b61c86:intro-to-variables
+      // The course is typically the first two segments
+      const parts = slug.split("/");
+      if (parts.length >= 2) {
+        // Try progressively shorter course slugs
+        for (let i = Math.min(parts.length - 1, 3); i >= 2; i--) {
+          const courseSlug = parts.slice(0, i).join("/");
+          const course = await this.getCourse(courseSlug);
+          if (course && course.units.length > 0) {
+            // Search for the matching lesson across all units
+            for (const unit of course.units) {
+              for (const lesson of unit.lessons) {
+                // Match by slug or by checking if the full slug ends with the lesson slug
+                if (
+                  lesson.slug === parts[parts.length - 1] ||
+                  slug.endsWith(lesson.slug) ||
+                  lesson.slug === slug.split("/").pop()
+                ) {
+                  const contentItems = lesson.contentItems;
+                  const videos = contentItems.filter((item) => item.kind === "Video").length;
+                  const articles = contentItems.filter((item) => item.kind === "Article").length;
+                  const exercises = contentItems.filter((item) => item.kind === "Exercise").length;
+
+                  const detail: KhanLessonDetail = {
+                    slug,
+                    title: lesson.title,
+                    description: "",
+                    url: buildKAUrl(slug),
+                    unitTitle: unit.title,
+                    courseTitle: course.title,
+                    contentItems,
+                    videos,
+                    articles,
+                    exercises,
+                  };
+
+                  this.cache.set(cacheKey, detail, CACHE_TTL);
+                  return detail;
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // Fallback: scrape the lesson page directly
+      return await this.scrapeLessonPage(slug);
+    } catch {
+      return null;
+    }
+  }
+
+  private async scrapeLessonPage(slug: string): Promise<KhanLessonDetail | null> {
+    try {
+      const response = await this.rateLimitedFetch(`https://www.khanacademy.org/${slug}`, {
+        headers: { Accept: "text/html" },
+      });
+
+      if (!response.ok) return null;
+
+      const html = await response.text();
+      const titleMatch = html.match(/<title>([^<]+)<\/title>/);
+      const descMatch = html.match(/<meta\s+name="description"\s+content="([^"]+)"/);
+      const title = titleMatch?.[1]?.replace(/ \| Khan Academy$/, "").trim() ?? slug;
+      const description = descMatch?.[1] ?? "";
+
+      const contentItems: KhanContentSummary[] = [];
+
+      // Try Apollo state for content items
+      const stateMatch = html.match(/window\.__APOLLO_STATE__\s*=\s*({.+?});?\s*<\/script>/s);
+      if (stateMatch) {
+        try {
+          const state = JSON.parse(stateMatch[1]);
+          for (const [key, value] of Object.entries(state)) {
+            const v = value as Record<string, unknown>;
+            if (
+              v.translatedTitle &&
+              v.contentKind &&
+              typeof v.translatedTitle === "string" &&
+              typeof v.contentKind === "string" &&
+              !key.startsWith("Topic:") &&
+              !key.startsWith("Course:")
+            ) {
+              contentItems.push({
+                slug: (v.slug as string) ?? "",
+                title: v.translatedTitle,
+                kind: (v.contentKind as ContentKind) ?? "Unknown",
+                url: buildKAUrl((v.relativeUrl as string) ?? (v.canonicalUrl as string) ?? ""),
+                description: (v.translatedDescription as string) ?? undefined,
+              });
+            }
+          }
+        } catch {
+          // Ignore parse errors
+        }
+      }
+
+      const videos = contentItems.filter((item) => item.kind === "Video").length;
+      const articles = contentItems.filter((item) => item.kind === "Article").length;
+      const exercises = contentItems.filter((item) => item.kind === "Exercise").length;
+
+      const detail: KhanLessonDetail = {
+        slug,
+        title,
+        description,
+        url: buildKAUrl(slug),
+        contentItems,
+        videos,
+        articles,
+        exercises,
+      };
+
+      this.cache.set(`lesson:${slug}`, detail, CACHE_TTL);
+      return detail;
+    } catch {
+      return null;
+    }
+  }
+
+  // ─── get_exercise ───────────────────────────────────────────────
+
+  async getExercise(slugOrUrl: string): Promise<KhanExercise | null> {
+    const slug = normalizeSlug(slugOrUrl);
+    const cacheKey = `exercise:${slug}`;
+    const cached = this.cache.get<KhanExercise>(cacheKey);
+    if (cached) return cached;
+
+    // Get basic exercise metadata from ContentForPath
+    const result = await this.contentForPath(slug);
+    const raw = result?.content;
+
+    if (!raw) return null;
+
+    const exerciseTitle = raw.translatedTitle ?? slug;
+    const exerciseSlug = raw.slug ?? slug;
+    const exerciseUrl = buildKAUrl(raw.relativeUrl ?? slug);
+    const description = raw.translatedDescription ?? raw.description ?? "";
+    const problemTypeKind = (raw as unknown as { problemTypeKind?: string }).problemTypeKind;
+
+    // Try to find this exercise in its course structure for richer context
+    const parts = slug.split("/");
+    let relatedContent: KhanContentSummary[] = [];
+    let lessonTitle: string | undefined;
+    let unitTitle: string | undefined;
+    let courseTitle: string | undefined;
+    let exerciseLength: number | undefined;
+    let timeEstimate: { lowerBound: number; upperBound: number } | undefined;
+
+    if (parts.length >= 2) {
+      for (let i = Math.min(parts.length - 1, 3); i >= 2; i--) {
+        const courseSlug = parts.slice(0, i).join("/");
+        const courseResult = await this.contentForPath(courseSlug);
+        if (courseResult?.course) {
+          const course = courseResult.course;
+          courseTitle = course.translatedTitle;
+
+          // Search for the exercise in the course structure
+          for (const unit of course.unitChildren ?? []) {
+            for (const lesson of unit.allOrderedChildren ?? []) {
+              const items = lesson.curatedChildren ?? [];
+              const found = items.find(
+                (item) =>
+                  item.slug === exerciseSlug ||
+                  item.slug === parts[parts.length - 1] ||
+                  (item.canonicalUrl ?? "").includes(exerciseSlug)
+              );
+              if (found) {
+                lessonTitle = lesson.translatedTitle;
+                unitTitle = unit.translatedTitle;
+                // Collect sibling content items (videos, articles in the same lesson)
+                relatedContent = items
+                  .filter((item) => item.slug !== found.slug)
+                  .map((item) => ({
+                    slug: item.slug ?? "",
+                    title: item.translatedTitle ?? "",
+                    kind: (item.contentKind as ContentKind) ?? "Unknown",
+                    url: buildKAUrl(item.urlWithinCurationNode ?? item.canonicalUrl ?? ""),
+                    description: item.translatedDescription,
+                  }));
+                break;
+              }
+            }
+            if (lessonTitle) break;
+          }
+          if (lessonTitle) break;
+        }
+      }
+    }
+
+    const exercise: KhanExercise = {
+      slug: exerciseSlug,
+      title: exerciseTitle,
+      description,
+      url: exerciseUrl,
+      exerciseLength,
+      timeEstimate,
+      problemTypeKind,
+      relatedContent,
+      lessonTitle,
+      unitTitle,
+      courseTitle,
+    };
+
+    this.cache.set(cacheKey, exercise, CACHE_TTL);
+    return exercise;
+  }
+
+  // ─── get_quiz ──────────────────────────────────────────────────
+
+  async getQuizzes(slugOrUrl: string): Promise<KhanQuiz[]> {
+    const slug = normalizeSlug(slugOrUrl);
+    const cacheKey = `quizzes:${slug}`;
+    const cached = this.cache.get<KhanQuiz[]>(cacheKey);
+    if (cached) return cached;
+
+    const result = await this.contentForPath(slug);
+    if (!result?.course) return [];
+
+    const course = result.course;
+    const courseTitle = course.translatedTitle ?? slug;
+    const quizzes: KhanQuiz[] = [];
+
+    for (const unit of course.unitChildren ?? []) {
+      const unitTitle = unit.translatedTitle ?? "";
+      const lessonsBeforeQuiz: Array<{ title: string; slug: string; url: string }> = [];
+
+      for (const child of unit.allOrderedChildren ?? []) {
+        const typename = (child as unknown as { __typename: string }).__typename;
+
+        if (typename === "TopicQuiz" || typename === "TopicUnitTest") {
+          const quizData = child as unknown as QuizUnitTestData;
+          const kind = typename === "TopicQuiz" ? "Quiz" : "UnitTest";
+          const quizUrl = buildKAUrl(
+            quizData.urlWithinCurationNode ?? quizData.canonicalUrl ?? ""
+          );
+
+          // Collect exercises from covered lessons
+          const relatedExercises: KhanContentSummary[] = [];
+          for (const lesson of lessonsBeforeQuiz) {
+            // Find lesson in course structure and get its exercises
+            for (const u of course.unitChildren ?? []) {
+              for (const l of u.allOrderedChildren ?? []) {
+                if (l.translatedTitle === lesson.title || l.slug === lesson.slug) {
+                  for (const item of l.curatedChildren ?? []) {
+                    if (item.contentKind === "Exercise") {
+                      relatedExercises.push({
+                        slug: item.slug ?? "",
+                        title: item.translatedTitle ?? "",
+                        kind: "Exercise",
+                        url: buildKAUrl(item.urlWithinCurationNode ?? item.canonicalUrl ?? ""),
+                        description: item.translatedDescription,
+                      });
+                    }
+                  }
+                }
+              }
+            }
+          }
+
+          quizzes.push({
+            slug: quizData.slug ?? "",
+            title: quizData.translatedTitle ?? `${unitTitle}: ${kind}`,
+            description: quizData.translatedDescription ?? "",
+            url: quizUrl,
+            kind: kind as "Quiz" | "UnitTest",
+            exerciseLength: quizData.exerciseLength ?? 0,
+            timeEstimate: quizData.timeEstimate,
+            unitTitle,
+            courseTitle,
+            coveredLessons: [...lessonsBeforeQuiz],
+            relatedExercises,
+          });
+
+          // Reset for next quiz (unit tests cover all lessons, quizzes cover since last quiz)
+          if (typename === "TopicQuiz") {
+            lessonsBeforeQuiz.length = 0;
+          }
+        } else {
+          // It's a lesson — track it
+          if (child.translatedTitle) {
+            lessonsBeforeQuiz.push({
+              title: child.translatedTitle,
+              slug: child.slug ?? "",
+              url: buildKAUrl(child.relativeUrl ?? ""),
+            });
+          }
+        }
+      }
+    }
+
+    // Add course challenge if present
+    const cc = course.courseChallenge as QuizUnitTestData | undefined;
+    if (cc) {
+      quizzes.push({
+        slug: cc.slug ?? "",
+        title: `${courseTitle}: Course Challenge`,
+        description: "Comprehensive assessment covering all course material.",
+        url: buildKAUrl(cc.urlWithinCurationNode ?? ""),
+        kind: "CourseChallenge",
+        exerciseLength: cc.exerciseLength ?? 30,
+        timeEstimate: cc.timeEstimate,
+        courseTitle,
+        coveredLessons: [],
+        relatedExercises: [],
+      });
+    }
+
+    this.cache.set(cacheKey, quizzes, CACHE_TTL);
+    return quizzes;
+  }
+
+  // ─── video thumbnail ─────────────────────────────────────────────
+
+  async fetchVideoThumbnail(
+    youtubeId: string
+  ): Promise<{ data: string; mimeType: string } | null> {
+    const cacheKey = `thumb:${youtubeId}`;
+    const cached = this.cache.get<{ data: string; mimeType: string }>(cacheKey);
+    if (cached) return cached;
+
+    // Try thumbnail URLs in descending quality order
+    const urls = [
+      `https://img.youtube.com/vi/${youtubeId}/sddefault.jpg`,
+      `https://img.youtube.com/vi/${youtubeId}/hqdefault.jpg`,
+      `https://img.youtube.com/vi/${youtubeId}/mqdefault.jpg`,
+    ];
+
+    for (const url of urls) {
+      try {
+        const response = await this.rateLimitedFetch(url);
+        if (!response.ok) continue;
+
+        const buffer = await response.arrayBuffer();
+        // Skip tiny placeholder images (YouTube returns a small grey image for missing thumbnails)
+        if (buffer.byteLength < 1000) continue;
+
+        const base64 = Buffer.from(buffer).toString("base64");
+        const result = { data: base64, mimeType: "image/jpeg" };
+        this.cache.set(cacheKey, result, CACHE_TTL);
+        return result;
+      } catch {
+        continue;
+      }
+    }
+
+    return null;
   }
 
   // ─── get_transcript ──────────────────────────────────────────────
@@ -849,6 +1348,7 @@ interface CourseData {
   relativeUrl?: string;
   iconPath?: string;
   unitChildren?: UnitData[];
+  courseChallenge?: QuizUnitTestData;
 }
 
 interface UnitData {
@@ -887,9 +1387,13 @@ interface SearchPageResponse {
 interface SearchResultData {
   contentId: string;
   kind: string;
+  relativeUrl?: string;
+  slug?: string;
   learnableContent?: {
     translatedTitle?: string;
     translatedDescription?: string;
+    relativeUrl?: string;
+    slug?: string;
     parentTopic?: ParentTopicData;
   };
 }
@@ -898,6 +1402,20 @@ interface ParentTopicData {
   translatedTitle?: string;
   contentKind?: string;
   parent?: ParentTopicData;
+}
+
+interface QuizUnitTestData {
+  __typename?: string;
+  slug?: string;
+  translatedTitle?: string;
+  translatedDescription?: string;
+  contentKind?: string;
+  exerciseLength?: number;
+  timeEstimate?: { lowerBound: number; upperBound: number };
+  canonicalUrl?: string;
+  urlWithinCurationNode?: string;
+  contentDescriptor?: string;
+  progressKey?: string;
 }
 
 interface LearnMenuCategory {

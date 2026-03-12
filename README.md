@@ -44,6 +44,12 @@ Add this to your Claude Desktop config (`~/Library/Application Support/Claude/cl
 | `get_content` | Get details about a specific content item (video, article, exercise) |
 | `get_course` | Get full course structure with units, lessons, and content items |
 | `get_transcript` | Get video transcripts (timestamped or full text) |
+| `get_article` | Read the full text content of a Khan Academy article |
+| `get_lesson` | Get all content items in a specific lesson |
+| `embed_video` | Embed a video with thumbnail image, metadata, chapters, and optional transcript |
+| `get_exercise` | Get exercise details with related study content (videos, articles) and practice URL |
+| `get_quiz` | List all quizzes, unit tests, and course challenge for a course with prep material |
+| `study_guide` | Build a structured study plan for any topic |
 
 ### Tool Details
 
@@ -79,11 +85,62 @@ language?: string — Language code (default: "en")
 format?: string  — "full", "timestamped", or "both" (default: "full")
 ```
 
+#### `get_article`
+```
+slug: string     — Article slug or full URL (articles have "/a/" in the path)
+```
+
+#### `get_lesson`
+```
+slug: string     — Lesson slug or full URL
+```
+
+#### `embed_video`
+```
+slug: string              — Video slug, KA URL, YouTube URL, or YouTube ID
+include_transcript?: bool — Include the full transcript (default: false)
+language?: string         — Language code for transcript (default: "en")
+```
+
+#### `get_exercise`
+```
+slug: string     — Exercise slug or full URL (exercises have "/e/" in the path)
+```
+
+#### `get_quiz`
+```
+slug: string     — Course slug or URL (e.g., "math/algebra")
+kind?: string    — "all", "quiz", "unit-test", or "course-challenge" (default: "all")
+```
+
+#### `study_guide`
+```
+topic: string    — Topic or concept to study (e.g., "quadratic equations")
+depth?: string   — "quick", "standard", or "comprehensive" (default: "standard")
+```
+
+## Workflows
+
+**Topic exploration:**
+`list_subjects` → `get_topic_tree` → `get_course` → `get_lesson` → `get_content` / `get_transcript`
+
+**Quick lookup:**
+`search` → `get_content` or `get_article` → `get_transcript` (if video)
+
+**Study session:**
+`search` or `get_topic_tree` → `study_guide` for review, then `get_article` / `get_transcript` for deep dives
+
+**Course overview:**
+`get_course` → pick a unit/lesson → `get_lesson` → `get_content`
+
+**Test prep:**
+`get_quiz` → review covered lessons → `get_exercise` for practice → `get_transcript` / `get_article` to study weak areas
+
 ## Development
 
 ```bash
 git clone https://github.com/aicoder2009/khanacademyMCP.git
-cd khanacademy-mcp
+cd khanacademyMCP
 npm install
 npm run build
 ```

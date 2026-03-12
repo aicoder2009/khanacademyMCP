@@ -6,7 +6,7 @@ import { formatDuration } from "../khan-api/parser.js";
 export function registerTranscriptTool(server: McpServer, client: KhanClient) {
   server.tool(
     "get_transcript",
-    "Get the transcript of a Khan Academy video. Returns timestamped text and a full-text version. Accepts a KA video slug/URL or YouTube URL/ID.",
+    "Get a Khan Academy video's transcript as text. Returns full text, timestamped segments, or both. Accepts a video slug, KA URL, YouTube URL, or YouTube video ID.",
     {
       slug: z
         .string()
@@ -22,6 +22,7 @@ export function registerTranscriptTool(server: McpServer, client: KhanClient) {
         .default("full")
         .describe("Output format: 'full' (plain text), 'timestamped' (with timestamps), 'both' (default: 'full')"),
     },
+    { title: "Get Video Transcript", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     async ({ slug, language, format }) => {
       try {
         const transcript = await client.getTranscript(slug, language);

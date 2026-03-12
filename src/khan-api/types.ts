@@ -48,6 +48,7 @@ export interface KhanContent {
   authorNames?: string[];
   dateAdded?: string;
   kaUrl: string;
+  keyMoments?: KhanKeyMoment[];
 }
 
 export interface KhanCourse {
@@ -98,4 +99,61 @@ export interface KhanSearchResult {
 export interface GraphQLResponse<T = unknown> {
   data?: T;
   errors?: Array<{ message: string }>;
+}
+
+export interface KhanArticle {
+  slug: string;
+  title: string;
+  description: string;
+  url: string;
+  content: string;
+  authorNames?: string[];
+  dateAdded?: string;
+}
+
+export interface KhanLessonDetail {
+  slug: string;
+  title: string;
+  description: string;
+  url: string;
+  unitTitle?: string;
+  courseTitle?: string;
+  contentItems: KhanContentSummary[];
+  videos: number;
+  articles: number;
+  exercises: number;
+}
+
+export interface KhanKeyMoment {
+  label: string;
+  startOffset: number;
+  endOffset: number;
+}
+
+export interface KhanExercise {
+  slug: string;
+  title: string;
+  description: string;
+  url: string;
+  exerciseLength?: number;
+  timeEstimate?: { lowerBound: number; upperBound: number };
+  problemTypeKind?: string;
+  relatedContent: KhanContentSummary[];
+  lessonTitle?: string;
+  unitTitle?: string;
+  courseTitle?: string;
+}
+
+export interface KhanQuiz {
+  slug: string;
+  title: string;
+  description: string;
+  url: string;
+  kind: "Quiz" | "UnitTest" | "CourseChallenge";
+  exerciseLength: number;
+  timeEstimate?: { lowerBound: number; upperBound: number };
+  unitTitle?: string;
+  courseTitle?: string;
+  coveredLessons: Array<{ title: string; slug: string; url: string }>;
+  relatedExercises: KhanContentSummary[];
 }
