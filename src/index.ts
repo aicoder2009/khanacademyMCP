@@ -11,6 +11,12 @@ import { registerTranscriptTool } from "./tools/transcript.js";
 const server = new McpServer({
   name: "khanacademy-mcp",
   version: "1.0.0",
+  icons: [
+    {
+      src: "https://raw.githubusercontent.com/aicoder2009/khanacademyMCP/main/assets/khan-logo.png",
+      mimeType: "image/png",
+    },
+  ],
 });
 
 const client = new KhanClient();
