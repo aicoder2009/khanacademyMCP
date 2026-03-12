@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/khan-logo.png" alt="Khan Academy" width="400">
+</p>
+
 # Khan Academy MCP Server
 
 An open-source [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server that lets AI assistants search, browse, and read Khan Academy's educational content. No API key required.
@@ -78,7 +82,7 @@ format?: string  — "full", "timestamped", or "both" (default: "full")
 ## Development
 
 ```bash
-git clone https://github.com/your-username/khanacademy-mcp.git
+git clone https://github.com/aicoder2009/khanacademyMCP.git
 cd khanacademy-mcp
 npm install
 npm run build
