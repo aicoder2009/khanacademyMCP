@@ -9,13 +9,13 @@ An open-source [Model Context Protocol](https://modelcontextprotocol.io) (MCP) s
 ## Quick Start
 
 ```bash
-npx khanacademy-mcp
+npx khanmcp
 ```
 
 Or install globally:
 
 ```bash
-npm install -g khanacademy-mcp
+npm install -g khanmcp
 khanacademy-mcp
 ```
 
@@ -28,7 +28,7 @@ Add this to your Claude Desktop config (`~/Library/Application Support/Claude/cl
   "mcpServers": {
     "khanacademy": {
       "command": "npx",
-      "args": ["-y", "khanacademy-mcp"]
+      "args": ["-y", "khanmcp"]
     }
   }
 }

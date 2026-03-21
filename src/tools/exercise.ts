@@ -5,7 +5,7 @@ import { KhanClient } from "../khan-api/client.js";
 export function registerExerciseTool(server: McpServer, client: KhanClient) {
   server.tool(
     "get_exercise",
-    "Get detailed information about a Khan Academy exercise, including its practice URL, related lesson content (videos and articles to study first), and where it fits in the course. Use this when a student wants to practice a specific skill or prepare for an exercise.",
+    "Get details about a Khan Academy exercise, including its practice URL, related lesson content (videos and articles to study first), and where it fits in the course. Use this when a student wants to practice a specific skill or prepare for an exercise.",
     {
       slug: z
         .string()

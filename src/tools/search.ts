@@ -38,7 +38,11 @@ export function registerSearchTool(server: McpServer, client: KhanClient) {
           .join("\n\n");
 
         let text = `Found ${results.length} result${results.length === 1 ? "" : "s"} for "${query}":\n\n${formatted}`;
-        text += `\n\n---\nUse \`get_topic_tree\` with a parent subject slug to find content, or \`get_content\` / \`get_article\` / \`get_transcript\` with a content slug to get full details.`;
+        if (results.some((result) => result.slug)) {
+          text += `\n\n---\nUse \`get_topic_tree\` with a parent subject slug to find content, or \`get_content\` / \`get_article\` / \`get_transcript\` with a content slug to get full details.`;
+        } else {
+          text += `\n\n---\nKhan Academy's search API did not expose drill-down slugs for these results. Use the titles and parent paths to navigate with \`get_topic_tree\` or \`get_course\`.`;
+        }
 
         return {
           content: [

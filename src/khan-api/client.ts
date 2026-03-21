@@ -382,15 +382,18 @@ export class KhanClient {
           .map((r) => {
             const lc = r.learnableContent!;
             const parentPath = this.buildParentPath(lc.parentTopic);
+            const relativeUrl = lc.relativeUrl ?? r.relativeUrl ?? "";
+            const slug = lc.slug ?? r.slug ?? normalizeSlug(relativeUrl);
             return {
               title: lc.translatedTitle ?? "",
               description: lc.translatedDescription ?? "",
               kind: (r.kind as ContentKind) ?? "Unknown",
-              url: "",
-              slug: "",
+              url: relativeUrl ? buildKAUrl(relativeUrl) : "",
+              slug,
               parentPath,
             };
           });
+
         this.cache.set(cacheKey, results, CACHE_TTL);
         return results;
       }
@@ -928,7 +931,12 @@ export class KhanClient {
     const exerciseSlug = raw.slug ?? slug;
     const exerciseUrl = buildKAUrl(raw.relativeUrl ?? slug);
     const description = raw.translatedDescription ?? raw.description ?? "";
-    const problemTypeKind = (raw as unknown as { problemTypeKind?: string }).problemTypeKind;
+    const exerciseMeta = raw as ContentData & {
+      problemTypeKind?: string;
+      exerciseLength?: number;
+      timeEstimate?: { lowerBound: number; upperBound: number };
+    };
+    const problemTypeKind = exerciseMeta.problemTypeKind;
 
     // Try to find this exercise in its course structure for richer context
     const parts = slug.split("/");
@@ -936,8 +944,8 @@ export class KhanClient {
     let lessonTitle: string | undefined;
     let unitTitle: string | undefined;
     let courseTitle: string | undefined;
-    let exerciseLength: number | undefined;
-    let timeEstimate: { lowerBound: number; upperBound: number } | undefined;
+    let exerciseLength = exerciseMeta.exerciseLength;
+    let timeEstimate = exerciseMeta.timeEstimate;
 
     if (parts.length >= 2) {
       for (let i = Math.min(parts.length - 1, 3); i >= 2; i--) {
