@@ -1,4 +1,5 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { createRequire } from "node:module";
 import { KhanClient } from "./khan-api/client.js";
 import { registerSearchTool } from "./tools/search.js";
 import { registerTopicTools } from "./tools/topics.js";
@@ -11,12 +12,19 @@ import { registerVideoTool } from "./tools/video.js";
 import { registerExerciseTool } from "./tools/exercise.js";
 import { registerQuizTool } from "./tools/quiz.js";
 
-export const SERVER_VERSION = "0.4.0";
+const require = createRequire(import.meta.url);
+const packageMetadata = require("../package.json") as {
+  description?: string;
+  version?: string;
+};
+
+export const SERVER_VERSION = packageMetadata.version ?? "0.4.1";
 
 export const SERVER_INFO = {
   name: "khanacademy-mcp",
   title: "Khan Academy",
   description:
+    packageMetadata.description ??
     "Access Khan Academy's vast educational library — search courses, browse topics, read articles, watch video transcripts, explore lessons, and generate study guides.",
   version: SERVER_VERSION,
   icons: [

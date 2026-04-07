@@ -13,17 +13,23 @@ import {
   ContentKind,
   KhanArticle,
   KhanLessonDetail,
-  KhanKeyMoment,
   KhanExercise,
   KhanQuiz,
 } from "./types.js";
-import { normalizeSlug, buildKAUrl, detectContentKind, extractYouTubeId } from "./parser.js";
+import {
+  normalizeSlug,
+  buildKAUrl,
+  detectContentKind,
+  extractYouTubeId,
+  decodeHtmlEntities,
+} from "./parser.js";
 
 const KA_GRAPHQL_URL = "https://www.khanacademy.org/api/internal/graphql";
 
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 const TOPIC_CACHE_TTL = 30 * 60 * 1000; // 30 minutes
 const MIN_REQUEST_INTERVAL = 500; // 500ms between requests
+const REQUEST_TIMEOUT_MS = 15_000;
 
 /** Persisted query hashes for KA's safelisted GraphQL operations. */
 const GQL_HASHES: Record<string, string> = {
@@ -80,7 +86,16 @@ export class KhanClient {
     const maxRetries = 3;
 
     while (retries <= maxRetries) {
-      const response = await fetch(url, options);
+      let response: Response;
+      try {
+        response = await fetch(url, {
+          ...options,
+          signal: options?.signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Unknown fetch failure";
+        throw new Error(`Request to ${url} failed: ${message}`, { cause: error });
+      }
 
       if (response.status === 429 && retries < maxRetries) {
         retries++;
@@ -95,6 +110,12 @@ export class KhanClient {
     throw new Error(`Request failed after ${maxRetries} retries`);
   }
 
+  private logWarning(message: string): void {
+    if (process.env.KHAN_MCP_DEBUG === "1") {
+      console.warn(`[khanacademy-mcp] ${message}`);
+    }
+  }
+
   /**
    * Execute a persisted GraphQL query via GET with hash parameter.
    * KA's internal API uses safelisted queries identified by a DJB2 hash.
@@ -106,7 +127,7 @@ export class KhanClient {
 
     const hash = GQL_HASHES[operation];
     if (!hash) {
-      console.error(`No hash for GraphQL operation: ${operation}`);
+      this.logWarning(`Missing GraphQL hash for operation "${operation}"`);
       return null;
     }
 
@@ -122,13 +143,13 @@ export class KhanClient {
       });
 
       if (!response.ok) {
-        console.error(`GraphQL ${operation}: ${response.status} ${response.statusText}`);
+        this.logWarning(`GraphQL ${operation} failed: ${response.status} ${response.statusText}`);
         return null;
       }
 
       const json = (await response.json()) as { data?: T; errors?: Array<{ message: string }> };
       if (json.errors?.length) {
-        console.error("GraphQL errors:", json.errors.map((e) => e.message).join(", "));
+        this.logWarning(`GraphQL ${operation} returned errors: ${json.errors.map((e) => e.message).join(", ")}`);
         return null;
       }
 
@@ -138,7 +159,9 @@ export class KhanClient {
       }
       return data;
     } catch (error) {
-      console.error(`GraphQL request error for ${operation}:`, error);
+      this.logWarning(
+        `GraphQL request error for ${operation}: ${error instanceof Error ? error.message : "Unknown error"}`
+      );
       return null;
     }
   }
@@ -160,7 +183,7 @@ export class KhanClient {
   async listSubjects(): Promise<KhanSubject[]> {
     const cacheKey = "subjects";
     const cached = this.cache.get<KhanSubject[]>(cacheKey);
-    if (cached) return cached;
+    if (cached !== undefined) return cached;
 
     try {
       const data = await this.graphql<{ learnMenuTopics: LearnMenuCategory[] }>(
@@ -190,6 +213,7 @@ export class KhanClient {
       // Fall through to static
     }
 
+    this.cache.set(cacheKey, STATIC_SUBJECTS, TOPIC_CACHE_TTL);
     return STATIC_SUBJECTS;
   }
 
@@ -297,13 +321,13 @@ export class KhanClient {
 
     if (topicEntries.length === 0) return null;
 
-    const rootEntry = topicEntries.find(([_, value]) => {
+    const rootEntry = topicEntries.find(([, value]) => {
       const v = value as Record<string, unknown>;
       return v.slug === slug || (v.relativeUrl as string)?.includes(slug);
     });
 
     if (!rootEntry) {
-      const [_, value] = topicEntries[0];
+      const [, value] = topicEntries[0];
       const v = value as Record<string, unknown>;
       return {
         slug: (v.slug as string) ?? slug,
@@ -315,7 +339,7 @@ export class KhanClient {
       };
     }
 
-    const [_, value] = rootEntry;
+    const [, value] = rootEntry;
     const v = value as Record<string, unknown>;
 
     const topic: KhanTopic = {
@@ -365,14 +389,17 @@ export class KhanClient {
   // ─── search ──────────────────────────────────────────────────────
 
   async search(query: string, limit: number = 10): Promise<KhanSearchResult[]> {
-    const cacheKey = `search:${query}:${limit}`;
+    const normalizedQuery = query.trim();
+    if (!normalizedQuery) return [];
+
+    const cacheKey = `search:${normalizedQuery}:${limit}`;
     const cached = this.cache.get<KhanSearchResult[]>(cacheKey);
-    if (cached) return cached;
+    if (cached !== undefined) return cached;
 
     // Primary: GraphQL search API
     try {
       const data = await this.graphql<SearchPageResponse>("getContentSearchResults", {
-        query,
+        query: normalizedQuery,
         numResults: limit,
       });
 
@@ -404,7 +431,7 @@ export class KhanClient {
     // Fallback: scrape search results page
     try {
       const response = await this.rateLimitedFetch(
-        `https://www.khanacademy.org/search?search_query=${encodeURIComponent(query)}`,
+        `https://www.khanacademy.org/search?search_query=${encodeURIComponent(normalizedQuery)}`,
         { headers: { Accept: "text/html" } }
       );
 
@@ -417,6 +444,7 @@ export class KhanClient {
       }
       return results;
     } catch {
+      this.cache.set(cacheKey, [], CACHE_TTL);
       return [];
     }
   }
@@ -442,7 +470,7 @@ export class KhanClient {
       try {
         const state = JSON.parse(stateMatch[1]);
         const entries = Object.entries(state);
-        for (const [_, value] of entries) {
+        for (const [, value] of entries) {
           if (results.length >= limit) break;
           const v = value as Record<string, unknown>;
           if (v.title && v.relativeUrl && typeof v.title === "string") {
@@ -469,7 +497,7 @@ export class KhanClient {
     const slug = normalizeSlug(slugOrUrl);
     const cacheKey = `content:${slug}`;
     const cached = this.cache.get<KhanContent>(cacheKey);
-    if (cached) return cached;
+    if (cached !== undefined) return cached;
 
     try {
       const result = await this.contentForPath(slug);
@@ -561,7 +589,7 @@ export class KhanClient {
     const slug = normalizeSlug(slugOrUrl);
     const cacheKey = `course:${slug}`;
     const cached = this.cache.get<KhanCourse>(cacheKey);
-    if (cached) return cached;
+    if (cached !== undefined) return cached;
 
     try {
       const result = await this.contentForPath(slug);
@@ -656,7 +684,7 @@ export class KhanClient {
     const slug = normalizeSlug(slugOrUrl);
     const cacheKey = `article:${slug}`;
     const cached = this.cache.get<KhanArticle>(cacheKey);
-    if (cached) return cached;
+    if (cached !== undefined) return cached;
 
     try {
       // Get metadata via ContentForPath
@@ -719,7 +747,7 @@ export class KhanClient {
     if (stateMatch) {
       try {
         const state = JSON.parse(stateMatch[1]);
-        for (const [_, value] of Object.entries(state)) {
+        for (const [, value] of Object.entries(state)) {
           const v = value as Record<string, unknown>;
 
           // Look for Perseus content (article content stored as JSON)
@@ -767,19 +795,21 @@ export class KhanClient {
   }
 
   private stripHtmlAndClean(html: string): string {
-    return html
-      .replace(/<br\s*\/?>/gi, "\n")
-      .replace(/<\/p>/gi, "\n\n")
-      .replace(/<\/div>/gi, "\n")
-      .replace(/<\/h[1-6]>/gi, "\n\n")
-      .replace(/<[^>]+>/g, "")
-      .replace(/&amp;/g, "&")
-      .replace(/&lt;/g, "<")
-      .replace(/&gt;/g, ">")
-      .replace(/&quot;/g, '"')
-      .replace(/&#39;/g, "'")
-      .replace(/&apos;/g, "'")
-      .replace(/&nbsp;/g, " ")
+    return this.cleanText(
+      html
+        .replace(/<br\s*\/?>/gi, "\n")
+        .replace(/<\/p>/gi, "\n\n")
+        .replace(/<\/div>/gi, "\n")
+        .replace(/<\/h[1-6]>/gi, "\n\n")
+        .replace(/<[^>]+>/g, "")
+        .replace(/\r/g, "")
+    );
+  }
+
+  private cleanText(text: string): string {
+    return decodeHtmlEntities(text)
+      .replace(/[ \t]+\n/g, "\n")
+      .replace(/\n[ \t]+/g, "\n")
       .replace(/\n{3,}/g, "\n\n")
       .trim();
   }
@@ -790,7 +820,7 @@ export class KhanClient {
     const slug = normalizeSlug(slugOrUrl);
     const cacheKey = `lesson:${slug}`;
     const cached = this.cache.get<KhanLessonDetail>(cacheKey);
-    if (cached) return cached;
+    if (cached !== undefined) return cached;
 
     try {
       // Strategy: extract course slug from lesson path, fetch course, find lesson
@@ -919,91 +949,93 @@ export class KhanClient {
     const slug = normalizeSlug(slugOrUrl);
     const cacheKey = `exercise:${slug}`;
     const cached = this.cache.get<KhanExercise>(cacheKey);
-    if (cached) return cached;
+    if (cached !== undefined) return cached;
 
-    // Get basic exercise metadata from ContentForPath
-    const result = await this.contentForPath(slug);
-    const raw = result?.content;
+    try {
+      const result = await this.contentForPath(slug);
+      const raw = result?.content;
 
-    if (!raw) return null;
+      if (!raw) return null;
 
-    const exerciseTitle = raw.translatedTitle ?? slug;
-    const exerciseSlug = raw.slug ?? slug;
-    const exerciseUrl = buildKAUrl(raw.relativeUrl ?? slug);
-    const description = raw.translatedDescription ?? raw.description ?? "";
-    const exerciseMeta = raw as ContentData & {
-      problemTypeKind?: string;
-      exerciseLength?: number;
-      timeEstimate?: { lowerBound: number; upperBound: number };
-    };
-    const problemTypeKind = exerciseMeta.problemTypeKind;
+      const exerciseTitle = raw.translatedTitle ?? slug;
+      const exerciseSlug = raw.slug ?? slug;
+      const exerciseUrl = buildKAUrl(raw.relativeUrl ?? slug);
+      const description = raw.translatedDescription ?? raw.description ?? "";
+      const exerciseMeta = raw as ContentData & {
+        problemTypeKind?: string;
+        exerciseLength?: number;
+        timeEstimate?: { lowerBound: number; upperBound: number };
+      };
+      const problemTypeKind = exerciseMeta.problemTypeKind;
 
-    // Try to find this exercise in its course structure for richer context
-    const parts = slug.split("/");
-    let relatedContent: KhanContentSummary[] = [];
-    let lessonTitle: string | undefined;
-    let unitTitle: string | undefined;
-    let courseTitle: string | undefined;
-    let exerciseLength = exerciseMeta.exerciseLength;
-    let timeEstimate = exerciseMeta.timeEstimate;
+      // Try to find this exercise in its course structure for richer context
+      const parts = slug.split("/");
+      let relatedContent: KhanContentSummary[] = [];
+      let lessonTitle: string | undefined;
+      let unitTitle: string | undefined;
+      let courseTitle: string | undefined;
+      const exerciseLength = exerciseMeta.exerciseLength;
+      const timeEstimate = exerciseMeta.timeEstimate;
 
-    if (parts.length >= 2) {
-      for (let i = Math.min(parts.length - 1, 3); i >= 2; i--) {
-        const courseSlug = parts.slice(0, i).join("/");
-        const courseResult = await this.contentForPath(courseSlug);
-        if (courseResult?.course) {
-          const course = courseResult.course;
-          courseTitle = course.translatedTitle;
+      if (parts.length >= 2) {
+        for (let i = Math.min(parts.length - 1, 3); i >= 2; i--) {
+          const courseSlug = parts.slice(0, i).join("/");
+          const courseResult = await this.contentForPath(courseSlug);
+          if (courseResult?.course) {
+            const course = courseResult.course;
+            courseTitle = course.translatedTitle;
 
-          // Search for the exercise in the course structure
-          for (const unit of course.unitChildren ?? []) {
-            for (const lesson of unit.allOrderedChildren ?? []) {
-              const items = lesson.curatedChildren ?? [];
-              const found = items.find(
-                (item) =>
-                  item.slug === exerciseSlug ||
-                  item.slug === parts[parts.length - 1] ||
-                  (item.canonicalUrl ?? "").includes(exerciseSlug)
-              );
-              if (found) {
-                lessonTitle = lesson.translatedTitle;
-                unitTitle = unit.translatedTitle;
-                // Collect sibling content items (videos, articles in the same lesson)
-                relatedContent = items
-                  .filter((item) => item.slug !== found.slug)
-                  .map((item) => ({
-                    slug: item.slug ?? "",
-                    title: item.translatedTitle ?? "",
-                    kind: (item.contentKind as ContentKind) ?? "Unknown",
-                    url: buildKAUrl(item.urlWithinCurationNode ?? item.canonicalUrl ?? ""),
-                    description: item.translatedDescription,
-                  }));
-                break;
+            // Search for the exercise in the course structure
+            for (const unit of course.unitChildren ?? []) {
+              for (const lesson of unit.allOrderedChildren ?? []) {
+                const items = lesson.curatedChildren ?? [];
+                const found = items.find(
+                  (item) =>
+                    item.slug === exerciseSlug ||
+                    item.slug === parts[parts.length - 1] ||
+                    (item.canonicalUrl ?? "").includes(exerciseSlug)
+                );
+                if (found) {
+                  lessonTitle = lesson.translatedTitle;
+                  unitTitle = unit.translatedTitle;
+                  relatedContent = items
+                    .filter((item) => item.slug !== found.slug)
+                    .map((item) => ({
+                      slug: item.slug ?? "",
+                      title: item.translatedTitle ?? "",
+                      kind: (item.contentKind as ContentKind) ?? "Unknown",
+                      url: buildKAUrl(item.urlWithinCurationNode ?? item.canonicalUrl ?? ""),
+                      description: item.translatedDescription,
+                    }));
+                  break;
+                }
               }
+              if (lessonTitle) break;
             }
             if (lessonTitle) break;
           }
-          if (lessonTitle) break;
         }
       }
+
+      const exercise: KhanExercise = {
+        slug: exerciseSlug,
+        title: exerciseTitle,
+        description,
+        url: exerciseUrl,
+        exerciseLength,
+        timeEstimate,
+        problemTypeKind,
+        relatedContent,
+        lessonTitle,
+        unitTitle,
+        courseTitle,
+      };
+
+      this.cache.set(cacheKey, exercise, CACHE_TTL);
+      return exercise;
+    } catch {
+      return null;
     }
-
-    const exercise: KhanExercise = {
-      slug: exerciseSlug,
-      title: exerciseTitle,
-      description,
-      url: exerciseUrl,
-      exerciseLength,
-      timeEstimate,
-      problemTypeKind,
-      relatedContent,
-      lessonTitle,
-      unitTitle,
-      courseTitle,
-    };
-
-    this.cache.set(cacheKey, exercise, CACHE_TTL);
-    return exercise;
   }
 
   // ─── get_quiz ──────────────────────────────────────────────────
@@ -1012,73 +1044,69 @@ export class KhanClient {
     const slug = normalizeSlug(slugOrUrl);
     const cacheKey = `quizzes:${slug}`;
     const cached = this.cache.get<KhanQuiz[]>(cacheKey);
-    if (cached) return cached;
+    if (cached !== undefined) return cached;
 
-    const result = await this.contentForPath(slug);
-    if (!result?.course) return [];
+    try {
+      const result = await this.contentForPath(slug);
+      if (!result?.course) return [];
 
-    const course = result.course;
-    const courseTitle = course.translatedTitle ?? slug;
-    const quizzes: KhanQuiz[] = [];
+      const course = result.course;
+      const courseTitle = course.translatedTitle ?? slug;
+      const quizzes: KhanQuiz[] = [];
 
-    for (const unit of course.unitChildren ?? []) {
-      const unitTitle = unit.translatedTitle ?? "";
-      const lessonsBeforeQuiz: Array<{ title: string; slug: string; url: string }> = [];
+      for (const unit of course.unitChildren ?? []) {
+        const unitTitle = unit.translatedTitle ?? "";
+        const lessonsBeforeQuiz: Array<{ title: string; slug: string; url: string }> = [];
 
-      for (const child of unit.allOrderedChildren ?? []) {
-        const typename = (child as unknown as { __typename: string }).__typename;
+        for (const child of unit.allOrderedChildren ?? []) {
+          const typename = (child as unknown as { __typename: string }).__typename;
 
-        if (typename === "TopicQuiz" || typename === "TopicUnitTest") {
-          const quizData = child as unknown as QuizUnitTestData;
-          const kind = typename === "TopicQuiz" ? "Quiz" : "UnitTest";
-          const quizUrl = buildKAUrl(
-            quizData.urlWithinCurationNode ?? quizData.canonicalUrl ?? ""
-          );
+          if (typename === "TopicQuiz" || typename === "TopicUnitTest") {
+            const quizData = child as unknown as QuizUnitTestData;
+            const kind = typename === "TopicQuiz" ? "Quiz" : "UnitTest";
+            const quizUrl = buildKAUrl(
+              quizData.urlWithinCurationNode ?? quizData.canonicalUrl ?? ""
+            );
 
-          // Collect exercises from covered lessons
-          const relatedExercises: KhanContentSummary[] = [];
-          for (const lesson of lessonsBeforeQuiz) {
-            // Find lesson in course structure and get its exercises
-            for (const u of course.unitChildren ?? []) {
-              for (const l of u.allOrderedChildren ?? []) {
-                if (l.translatedTitle === lesson.title || l.slug === lesson.slug) {
-                  for (const item of l.curatedChildren ?? []) {
-                    if (item.contentKind === "Exercise") {
-                      relatedExercises.push({
-                        slug: item.slug ?? "",
-                        title: item.translatedTitle ?? "",
-                        kind: "Exercise",
-                        url: buildKAUrl(item.urlWithinCurationNode ?? item.canonicalUrl ?? ""),
-                        description: item.translatedDescription,
-                      });
+            const relatedExercises: KhanContentSummary[] = [];
+            for (const lesson of lessonsBeforeQuiz) {
+              for (const u of course.unitChildren ?? []) {
+                for (const l of u.allOrderedChildren ?? []) {
+                  if (l.translatedTitle === lesson.title || l.slug === lesson.slug) {
+                    for (const item of l.curatedChildren ?? []) {
+                      if (item.contentKind === "Exercise") {
+                        relatedExercises.push({
+                          slug: item.slug ?? "",
+                          title: item.translatedTitle ?? "",
+                          kind: "Exercise",
+                          url: buildKAUrl(item.urlWithinCurationNode ?? item.canonicalUrl ?? ""),
+                          description: item.translatedDescription,
+                        });
+                      }
                     }
                   }
                 }
               }
             }
-          }
 
-          quizzes.push({
-            slug: quizData.slug ?? "",
-            title: quizData.translatedTitle ?? `${unitTitle}: ${kind}`,
-            description: quizData.translatedDescription ?? "",
-            url: quizUrl,
-            kind: kind as "Quiz" | "UnitTest",
-            exerciseLength: quizData.exerciseLength ?? 0,
-            timeEstimate: quizData.timeEstimate,
-            unitTitle,
-            courseTitle,
-            coveredLessons: [...lessonsBeforeQuiz],
-            relatedExercises,
-          });
+            quizzes.push({
+              slug: quizData.slug ?? "",
+              title: quizData.translatedTitle ?? `${unitTitle}: ${kind}`,
+              description: quizData.translatedDescription ?? "",
+              url: quizUrl,
+              kind: kind as "Quiz" | "UnitTest",
+              exerciseLength: quizData.exerciseLength ?? 0,
+              timeEstimate: quizData.timeEstimate,
+              unitTitle,
+              courseTitle,
+              coveredLessons: [...lessonsBeforeQuiz],
+              relatedExercises,
+            });
 
-          // Reset for next quiz (unit tests cover all lessons, quizzes cover since last quiz)
-          if (typename === "TopicQuiz") {
-            lessonsBeforeQuiz.length = 0;
-          }
-        } else {
-          // It's a lesson — track it
-          if (child.translatedTitle) {
+            if (typename === "TopicQuiz") {
+              lessonsBeforeQuiz.length = 0;
+            }
+          } else if (child.translatedTitle) {
             lessonsBeforeQuiz.push({
               title: child.translatedTitle,
               slug: child.slug ?? "",
@@ -1087,27 +1115,28 @@ export class KhanClient {
           }
         }
       }
-    }
 
-    // Add course challenge if present
-    const cc = course.courseChallenge as QuizUnitTestData | undefined;
-    if (cc) {
-      quizzes.push({
-        slug: cc.slug ?? "",
-        title: `${courseTitle}: Course Challenge`,
-        description: "Comprehensive assessment covering all course material.",
-        url: buildKAUrl(cc.urlWithinCurationNode ?? ""),
-        kind: "CourseChallenge",
-        exerciseLength: cc.exerciseLength ?? 30,
-        timeEstimate: cc.timeEstimate,
-        courseTitle,
-        coveredLessons: [],
-        relatedExercises: [],
-      });
-    }
+      const cc = course.courseChallenge as QuizUnitTestData | undefined;
+      if (cc) {
+        quizzes.push({
+          slug: cc.slug ?? "",
+          title: `${courseTitle}: Course Challenge`,
+          description: "Comprehensive assessment covering all course material.",
+          url: buildKAUrl(cc.urlWithinCurationNode ?? ""),
+          kind: "CourseChallenge",
+          exerciseLength: cc.exerciseLength ?? 30,
+          timeEstimate: cc.timeEstimate,
+          courseTitle,
+          coveredLessons: [],
+          relatedExercises: [],
+        });
+      }
 
-    this.cache.set(cacheKey, quizzes, CACHE_TTL);
-    return quizzes;
+      this.cache.set(cacheKey, quizzes, CACHE_TTL);
+      return quizzes;
+    } catch {
+      return [];
+    }
   }
 
   // ─── video thumbnail ─────────────────────────────────────────────
@@ -1117,7 +1146,7 @@ export class KhanClient {
   ): Promise<{ data: string; mimeType: string } | null> {
     const cacheKey = `thumb:${youtubeId}`;
     const cached = this.cache.get<{ data: string; mimeType: string }>(cacheKey);
-    if (cached) return cached;
+    if (cached !== undefined) return cached;
 
     // Try thumbnail URLs in descending quality order
     const urls = [
@@ -1153,7 +1182,7 @@ export class KhanClient {
     const slug = normalizeSlug(slugOrUrl);
     const cacheKey = `transcript:${slug}:${lang}`;
     const cached = this.cache.get<KhanTranscript>(cacheKey);
-    if (cached) return cached;
+    if (cached !== undefined) return cached;
 
     // Check if input is a YouTube URL — use YouTube fallback
     const directYoutubeId = extractYouTubeId(slugOrUrl);
@@ -1178,10 +1207,7 @@ export class KhanClient {
             .map((s) => ({
               start: (s.startTime ?? 0) / 1000,
               duration: ((s.endTime ?? 0) - (s.startTime ?? 0)) / 1000,
-              text: s.text
-                .replace(/<[^>]+>/g, "")
-                .replace(/\n/g, " ")
-                .trim(),
+              text: this.cleanText(s.text.replace(/<[^>]+>/g, "").replace(/\n/g, " ")),
             }))
             .filter((e) => e.text);
 
@@ -1275,16 +1301,7 @@ export class KhanClient {
     while ((match = textRegex.exec(xml)) !== null) {
       const start = parseFloat(match[1]);
       const duration = parseFloat(match[2]);
-      const text = match[3]
-        .replace(/<[^>]+>/g, "")
-        .replace(/&amp;/g, "&")
-        .replace(/&lt;/g, "<")
-        .replace(/&gt;/g, ">")
-        .replace(/&quot;/g, '"')
-        .replace(/&#39;/g, "'")
-        .replace(/&apos;/g, "'")
-        .replace(/\n/g, " ")
-        .trim();
+      const text = this.cleanText(match[3].replace(/<[^>]+>/g, "").replace(/\n/g, " "));
 
       if (text) {
         entries.push({ start, duration, text });

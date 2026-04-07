@@ -9,7 +9,7 @@ export function registerLessonTool(server: McpServer, client: KhanClient) {
     {
       slug: z.string().describe("Lesson slug or full URL (e.g., 'math/algebra/x2f8bb11595b61c86:foundation-algebra/x2f8bb11595b61c86:intro-to-variables')"),
     },
-    { title: "Get Lesson Contents", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    { title: "Get Lesson Contents", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     async ({ slug }) => {
       try {
         const lesson = await client.getLesson(slug);

@@ -7,7 +7,7 @@ export function registerTopicTools(server: McpServer, client: KhanClient) {
   server.tool(
     "list_subjects",
     "List all top-level Khan Academy subjects and courses. Returns names, slugs, and categories. Start here to explore Khan Academy's content, then use get_topic_tree to drill into a subject.",
-    { title: "List Subjects", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    { title: "List Subjects", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     async () => {
       try {
         const subjects = await client.listSubjects();
@@ -61,7 +61,7 @@ export function registerTopicTools(server: McpServer, client: KhanClient) {
         .default(1)
         .describe("How many levels deep to fetch (0=this topic only, 1=immediate children, max 3)"),
     },
-    { title: "Browse Topic Tree", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    { title: "Browse Topic Tree", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     async ({ slug, depth }) => {
       try {
         const topic = await client.getTopicTree(slug, depth);

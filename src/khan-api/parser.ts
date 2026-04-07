@@ -54,6 +54,10 @@ export function detectContentKind(urlOrSlug: string): ContentKind {
  * Extract YouTube video ID from a Khan Academy video page's metadata or URL.
  */
 export function extractYouTubeId(input: string): string | null {
+  if (/^[a-zA-Z0-9_-]{11}$/.test(input.trim())) {
+    return input.trim();
+  }
+
   // Direct YouTube URL patterns
   const patterns = [
     /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/,
@@ -76,10 +80,6 @@ export function extractGraphQLData<T>(
   response: { data?: Record<string, unknown>; errors?: Array<{ message: string }> },
   path: string
 ): T | null {
-  if (response.errors?.length) {
-    console.error("GraphQL errors:", response.errors);
-  }
-
   if (!response.data) return null;
 
   const parts = path.split(".");
@@ -98,10 +98,27 @@ export function extractGraphQLData<T>(
 export function formatDuration(seconds: number): string {
   const mins = Math.floor(seconds / 60);
   const secs = Math.floor(seconds % 60);
-  if (mins > 60) {
+  if (mins >= 60) {
     const hrs = Math.floor(mins / 60);
     const remainMins = mins % 60;
     return `${hrs}h ${remainMins}m`;
   }
   return `${mins}:${secs.toString().padStart(2, "0")}`;
+}
+
+export function decodeHtmlEntities(text: string): string {
+  return text
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&apos;/g, "'")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex: string) =>
+      String.fromCodePoint(parseInt(hex, 16))
+    )
+    .replace(/&#(\d+);/g, (_, dec: string) =>
+      String.fromCodePoint(parseInt(dec, 10))
+    );
 }

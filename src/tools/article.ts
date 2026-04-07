@@ -9,7 +9,7 @@ export function registerArticleTool(server: McpServer, client: KhanClient) {
     {
       slug: z.string().describe("Article slug or full URL (e.g., 'science/biology/intro-to-biology/what-is-biology/a/what-is-biology')"),
     },
-    { title: "Read Article", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    { title: "Read Article", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     async ({ slug }) => {
       try {
         const article = await client.getArticle(slug);

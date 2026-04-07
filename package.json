@@ -9,6 +9,10 @@
   },
   "scripts": {
     "build": "tsc && tsc -p tsconfig.api.json",
+    "build:test": "tsc -p tsconfig.test.json",
+    "lint": "eslint .",
+    "test": "npm run build:test && node --test dist-test/test/**/*.test.js",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.api.json",
     "start": "node dist/index.js",
     "dev": "tsc --watch"
   },
@@ -45,8 +49,12 @@
     "zod": "^3.24.4"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@types/node": "^22.15.3",
-    "typescript": "^5.8.3"
+    "eslint": "^10.2.0",
+    "globals": "^17.4.0",
+    "typescript": "^5.8.3",
+    "typescript-eslint": "^8.58.0"
   },
   "files": [
     "dist",

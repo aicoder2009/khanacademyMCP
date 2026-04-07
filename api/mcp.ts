@@ -8,12 +8,15 @@ const handler = createMcpHandler(
     registerAllTools(server, client);
   },
   {
-    serverInfo: SERVER_INFO,
-  } as any,
+    serverInfo: {
+      name: SERVER_INFO.name,
+      version: SERVER_INFO.version,
+    },
+  },
   {
     basePath: "/api",
     maxDuration: 60,
-    verboseLogs: true,
+    verboseLogs: false,
   }
 );
 

@@ -15,7 +15,7 @@ export function registerContentTools(server: McpServer, client: KhanClient) {
           "Content slug or full URL (e.g., 'math/algebra/v/intro-to-algebra', 'https://www.khanacademy.org/science/biology/a/intro-to-biology')"
         ),
     },
-    { title: "Get Content Details", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    { title: "Get Content Details", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     async ({ slug }) => {
       try {
         const content = await client.getContent(slug);
@@ -91,7 +91,7 @@ export function registerContentTools(server: McpServer, client: KhanClient) {
           "Course slug or URL (e.g., 'math/algebra', 'science/ap-biology', 'computing/computer-programming')"
         ),
     },
-    { title: "Get Course Structure", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    { title: "Get Course Structure", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     async ({ slug }) => {
       try {
         const course = await client.getCourse(slug);
