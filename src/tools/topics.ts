@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { KhanClient } from "../khan-api/client.js";
+import { toolErrorResult } from "./errors.js";
 
 export function registerTopicTools(server: McpServer, client: KhanClient) {
   // ─── list_subjects ───────────────────────────────────────────────
@@ -35,15 +36,7 @@ export function registerTopicTools(server: McpServer, client: KhanClient) {
           content: [{ type: "text" as const, text }],
         };
       } catch (error) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Error listing subjects: ${error instanceof Error ? error.message : "Unknown error"}`,
-            },
-          ],
-          isError: true,
-        };
+        return toolErrorResult(error, "listing subjects");
       }
     }
   );
@@ -112,15 +105,7 @@ export function registerTopicTools(server: McpServer, client: KhanClient) {
           content: [{ type: "text" as const, text }],
         };
       } catch (error) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Error fetching topic tree: ${error instanceof Error ? error.message : "Unknown error"}`,
-            },
-          ],
-          isError: true,
-        };
+        return toolErrorResult(error, "fetching the topic tree");
       }
     }
   );

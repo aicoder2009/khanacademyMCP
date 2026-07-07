@@ -2,6 +2,7 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { KhanClient } from "../khan-api/client.js";
 import { formatDuration } from "../khan-api/parser.js";
+import { toolErrorResult } from "./errors.js";
 
 export function registerStudyGuideTool(server: McpServer, client: KhanClient) {
   server.tool(
@@ -42,15 +43,20 @@ export function registerStudyGuideTool(server: McpServer, client: KhanClient) {
           const topResults = results.slice(0, detailLimit);
           for (const r of topResults) {
             if (r.slug) {
-              const content = await client.getContent(r.slug);
-              if (content) {
-                detailed.push({
-                  title: content.title,
-                  kind: content.kind,
-                  duration: content.duration,
-                  description: content.description,
-                  url: content.kaUrl,
-                });
+              // Detail enrichment is optional — skip items that fail rather than losing the whole guide
+              try {
+                const content = await client.getContent(r.slug);
+                if (content) {
+                  detailed.push({
+                    title: content.title,
+                    kind: content.kind,
+                    duration: content.duration,
+                    description: content.description,
+                    url: content.kaUrl,
+                  });
+                }
+              } catch {
+                continue;
               }
             }
           }
@@ -118,13 +124,7 @@ export function registerStudyGuideTool(server: McpServer, client: KhanClient) {
 
         return { content: [{ type: "text" as const, text }] };
       } catch (error) {
-        return {
-          content: [{
-            type: "text" as const,
-            text: `Error building study guide: ${error instanceof Error ? error.message : "Unknown error"}`,
-          }],
-          isError: true,
-        };
+        return toolErrorResult(error, "building the study guide");
       }
     }
   );

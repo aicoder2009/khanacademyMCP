@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { KhanClient } from "../src/khan-api/client.js";
+import { KhanApiError } from "../src/khan-api/errors.js";
 
 test("search short-circuits empty queries without network access", async () => {
   const client = new KhanClient();
@@ -44,26 +45,93 @@ test("getTranscript accepts a direct YouTube video ID", async () => {
   assert.deepEqual(capturedArgs, ["NybHckSEQBI", "es", "NybHckSEQBI"]);
 });
 
-test("getExercise returns null when the underlying content lookup throws", async () => {
+test("getExercise returns null when the underlying content lookup throws an internal error", async () => {
   const client = new KhanClient();
 
   (client as unknown as { contentForPath: () => Promise<never> }).contentForPath = async () => {
-    throw new Error("network unavailable");
+    throw new Error("unexpected parse failure");
   };
 
   const exercise = await client.getExercise("math/algebra/e/linear-equations");
   assert.equal(exercise, null);
 });
 
-test("getQuizzes returns an empty list when the underlying content lookup throws", async () => {
+test("getExercise propagates transport failures as KhanApiError", async () => {
   const client = new KhanClient();
 
   (client as unknown as { contentForPath: () => Promise<never> }).contentForPath = async () => {
-    throw new Error("network unavailable");
+    throw new KhanApiError("connection refused", "network");
+  };
+
+  await assert.rejects(
+    client.getExercise("math/algebra/e/linear-equations"),
+    (error: unknown) => error instanceof KhanApiError && error.reason === "network"
+  );
+});
+
+test("getQuizzes returns an empty list when the underlying content lookup throws an internal error", async () => {
+  const client = new KhanClient();
+
+  (client as unknown as { contentForPath: () => Promise<never> }).contentForPath = async () => {
+    throw new Error("unexpected parse failure");
   };
 
   const quizzes = await client.getQuizzes("math/algebra");
   assert.deepEqual(quizzes, []);
+});
+
+test("getQuizzes propagates transport failures as KhanApiError", async () => {
+  const client = new KhanClient();
+
+  (client as unknown as { contentForPath: () => Promise<never> }).contentForPath = async () => {
+    throw new KhanApiError("HTTP 502", "http", { status: 502 });
+  };
+
+  await assert.rejects(
+    client.getQuizzes("math/algebra"),
+    (error: unknown) => error instanceof KhanApiError && error.status === 502
+  );
+});
+
+test("getContent throws KhanApiError when both the API and the scrape fallback are unreachable", async () => {
+  const client = new KhanClient();
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = (async () => {
+    throw new Error("getaddrinfo ENOTFOUND www.khanacademy.org");
+  }) as typeof fetch;
+
+  try {
+    await assert.rejects(
+      client.getContent("math/algebra/v/intro-to-algebra"),
+      (error: unknown) => error instanceof KhanApiError && error.reason === "network"
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("getContent returns null when Khan Academy responds but the content does not exist", async () => {
+  const client = new KhanClient();
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const url = String(input);
+    if (url.includes("/api/internal/graphql")) {
+      return new Response(JSON.stringify({ data: { contentRoute: { listedPathData: null } } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response("Not Found", { status: 404 });
+  }) as typeof fetch;
+
+  try {
+    const content = await client.getContent("math/no-such-thing/v/nope");
+    assert.equal(content, null);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("listSubjects caches static fallback results after a failed API lookup", async () => {

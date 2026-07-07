@@ -2,6 +2,7 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { KhanClient } from "../khan-api/client.js";
 import { formatDuration } from "../khan-api/parser.js";
+import { toolErrorResult } from "./errors.js";
 
 export function registerVideoTool(server: McpServer, client: KhanClient) {
   server.tool(
@@ -107,9 +108,14 @@ export function registerVideoTool(server: McpServer, client: KhanClient) {
 
         contentBlocks.push({ type: "text" as const, text });
 
-        // Optionally include transcript
+        // Optionally include transcript — a transcript failure shouldn't lose the video embed
         if (include_transcript) {
-          const transcript = await client.getTranscript(slug, language);
+          let transcript = null;
+          try {
+            transcript = await client.getTranscript(slug, language);
+          } catch {
+            // Fall through to the not-available message
+          }
           if (transcript) {
             let transcriptText = `\n### Transcript\n`;
             transcriptText += `**Language:** ${transcript.language} | **Segments:** ${transcript.entries.length}\n\n`;
@@ -125,15 +131,7 @@ export function registerVideoTool(server: McpServer, client: KhanClient) {
 
         return { content: contentBlocks };
       } catch (error) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Error embedding video: ${error instanceof Error ? error.message : "Unknown error"}`,
-            },
-          ],
-          isError: true,
-        };
+        return toolErrorResult(error, "embedding the video");
       }
     }
   );

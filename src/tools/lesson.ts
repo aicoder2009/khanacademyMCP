@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { KhanClient } from "../khan-api/client.js";
+import { toolErrorResult } from "./errors.js";
 
 export function registerLessonTool(server: McpServer, client: KhanClient) {
   server.tool(
@@ -44,13 +45,7 @@ export function registerLessonTool(server: McpServer, client: KhanClient) {
 
         return { content: [{ type: "text" as const, text }] };
       } catch (error) {
-        return {
-          content: [{
-            type: "text" as const,
-            text: `Error fetching lesson: ${error instanceof Error ? error.message : "Unknown error"}`,
-          }],
-          isError: true,
-        };
+        return toolErrorResult(error, "fetching the lesson");
       }
     }
   );

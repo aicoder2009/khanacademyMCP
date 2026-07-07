@@ -2,6 +2,7 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { KhanClient } from "../khan-api/client.js";
 import { formatDuration } from "../khan-api/parser.js";
+import { toolErrorResult } from "./errors.js";
 
 export function registerContentTools(server: McpServer, client: KhanClient) {
   // ─── get_content ─────────────────────────────────────────────────
@@ -67,15 +68,7 @@ export function registerContentTools(server: McpServer, client: KhanClient) {
           content: [{ type: "text" as const, text }],
         };
       } catch (error) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Error fetching content: ${error instanceof Error ? error.message : "Unknown error"}`,
-            },
-          ],
-          isError: true,
-        };
+        return toolErrorResult(error, "fetching content details");
       }
     }
   );
@@ -146,15 +139,7 @@ export function registerContentTools(server: McpServer, client: KhanClient) {
           content: [{ type: "text" as const, text }],
         };
       } catch (error) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Error fetching course: ${error instanceof Error ? error.message : "Unknown error"}`,
-            },
-          ],
-          isError: true,
-        };
+        return toolErrorResult(error, "fetching the course structure");
       }
     }
   );

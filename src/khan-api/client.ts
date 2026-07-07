@@ -23,6 +23,7 @@ import {
   extractYouTubeId,
   decodeHtmlEntities,
 } from "./parser.js";
+import { KhanApiError } from "./errors.js";
 
 const KA_GRAPHQL_URL = "https://www.khanacademy.org/api/internal/graphql";
 
@@ -105,11 +106,23 @@ export class KhanClient {
           signal: options?.signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS),
         });
       } catch (error) {
+        const isTimeout = error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError");
         const message = error instanceof Error ? error.message : "Unknown fetch failure";
-        throw new Error(`Request to ${url} failed: ${message}`, { cause: error });
+        throw new KhanApiError(
+          `Request to ${url} ${isTimeout ? "timed out" : `failed: ${message}`}`,
+          isTimeout ? "timeout" : "network",
+          { cause: error }
+        );
       }
 
-      if ((response.status === 429 || response.status === 503) && retries < maxRetries) {
+      if (response.status === 429 || response.status === 503) {
+        if (retries >= maxRetries) {
+          throw new KhanApiError(
+            `Request to ${url} still returned ${response.status} after ${maxRetries} retries`,
+            "rate_limited",
+            { status: response.status }
+          );
+        }
         retries++;
         const retryAfterSeconds = Number(response.headers.get("retry-after"));
         const backoff = Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
@@ -122,7 +135,8 @@ export class KhanClient {
       return response;
     }
 
-    throw new Error(`Request failed after ${maxRetries} retries`);
+    // Unreachable: the loop always returns or throws
+    throw new KhanApiError(`Request to ${url} failed`, "network");
   }
 
   private logWarning(message: string): void {
@@ -159,6 +173,14 @@ export class KhanClient {
 
       if (!response.ok) {
         this.logWarning(`GraphQL ${operation} failed: ${response.status} ${response.statusText}`);
+        if (response.status >= 500) {
+          throw new KhanApiError(
+            `Khan Academy API returned HTTP ${response.status} for ${operation}`,
+            "http",
+            { status: response.status }
+          );
+        }
+        // 4xx: bad request or stale query hash — content-level failure, let fallbacks run
         return null;
       }
 
@@ -174,6 +196,7 @@ export class KhanClient {
       }
       return data;
     } catch (error) {
+      if (error instanceof KhanApiError) throw error;
       this.logWarning(
         `GraphQL request error for ${operation}: ${error instanceof Error ? error.message : "Unknown error"}`
       );
@@ -240,6 +263,8 @@ export class KhanClient {
     const cached = this.cache.get<KhanTopic>(cacheKey);
     if (cached) return cached;
 
+    let unavailable: KhanApiError | undefined;
+
     // Try ContentForPath — works for courses
     try {
       const result = await this.contentForPath(normalizedSlug);
@@ -248,12 +273,21 @@ export class KhanClient {
         this.cache.set(cacheKey, topic, TOPIC_CACHE_TTL);
         return topic;
       }
-    } catch {
-      // Fall through
+    } catch (error) {
+      if (error instanceof KhanApiError) unavailable = error;
     }
 
     // Fallback: scrape the page
-    return await this.scrapeTopicPage(normalizedSlug, depth);
+    try {
+      const topic = await this.scrapeTopicPage(normalizedSlug, depth);
+      if (topic) return topic;
+    } catch (error) {
+      if (error instanceof KhanApiError) unavailable ??= error;
+      else throw error;
+    }
+
+    if (unavailable) throw unavailable;
+    return null;
   }
 
   private mapCourseToTopic(course: CourseData, slug: string, depth: number): KhanTopic {
@@ -304,29 +338,51 @@ export class KhanClient {
     }));
   }
 
-  private async scrapeTopicPage(slug: string, depth: number): Promise<KhanTopic | null> {
-    try {
-      const response = await this.rateLimitedFetch(`https://www.khanacademy.org/${slug}`, {
-        headers: { Accept: "text/html" },
-      });
+  /** Fetch a KA page for scraping. Returns null for 4xx (page doesn't exist); throws KhanApiError on transport/server failure. */
+  private async fetchPageHtml(slug: string): Promise<string | null> {
+    const response = await this.rateLimitedFetch(`https://www.khanacademy.org/${slug}`, {
+      headers: { Accept: "text/html" },
+    });
 
-      if (!response.ok) return null;
-
-      const html = await response.text();
-
-      const stateMatch = html.match(/window\.__APOLLO_STATE__\s*=\s*({.+?});?\s*<\/script>/s);
-      if (!stateMatch) {
-        return this.parseMetaTags(html, slug);
+    if (!response.ok) {
+      if (response.status >= 500) {
+        throw new KhanApiError(
+          `Khan Academy returned HTTP ${response.status} for page /${slug}`,
+          "http",
+          { status: response.status }
+        );
       }
-
-      try {
-        const state = JSON.parse(stateMatch[1]);
-        return this.parseApolloState(state, slug, depth);
-      } catch {
-        return this.parseMetaTags(html, slug);
-      }
-    } catch {
       return null;
+    }
+
+    const html = await response.text();
+
+    // KA serves an anti-bot challenge page (HTTP 200) for some requests —
+    // never scrape it as if it were real content.
+    const titleMatch = html.match(/<title>([^<]*)<\/title>/);
+    const title = titleMatch?.[1]?.trim() ?? "";
+    if (/^(client challenge|just a moment|access denied|attention required)/i.test(title)) {
+      this.logWarning(`Page scrape for /${slug} was blocked by an anti-bot challenge`);
+      return null;
+    }
+
+    return html;
+  }
+
+  private async scrapeTopicPage(slug: string, depth: number): Promise<KhanTopic | null> {
+    const html = await this.fetchPageHtml(slug);
+    if (html === null) return null;
+
+    const stateMatch = html.match(/window\.__APOLLO_STATE__\s*=\s*({.+?});?\s*<\/script>/s);
+    if (!stateMatch) {
+      return this.parseMetaTags(html, slug);
+    }
+
+    try {
+      const state = JSON.parse(stateMatch[1]);
+      return this.parseApolloState(state, slug, depth);
+    } catch {
+      return this.parseMetaTags(html, slug);
     }
   }
 
@@ -411,6 +467,8 @@ export class KhanClient {
     const cached = this.cache.get<KhanSearchResult[]>(cacheKey);
     if (cached !== undefined) return cached;
 
+    let unavailable: KhanApiError | undefined;
+
     // Primary: GraphQL search API
     try {
       const data = await this.graphql<SearchPageResponse>("getContentSearchResults", {
@@ -439,8 +497,9 @@ export class KhanClient {
         this.cache.set(cacheKey, results, CACHE_TTL);
         return results;
       }
-    } catch {
-      // Fall through
+    } catch (error) {
+      if (error instanceof KhanApiError) unavailable = error;
+      else throw error;
     }
 
     // Fallback: scrape search results page
@@ -450,18 +509,21 @@ export class KhanClient {
         { headers: { Accept: "text/html" } }
       );
 
-      if (!response.ok) return [];
-
-      const html = await response.text();
-      const results = this.parseSearchResults(html, limit);
-      if (results.length) {
-        this.cache.set(cacheKey, results, CACHE_TTL);
+      if (response.ok) {
+        const html = await response.text();
+        const results = this.parseSearchResults(html, limit);
+        if (results.length) {
+          this.cache.set(cacheKey, results, CACHE_TTL);
+          return results;
+        }
       }
-      return results;
-    } catch {
-      this.cache.set(cacheKey, [], CACHE_TTL);
-      return [];
+    } catch (error) {
+      if (error instanceof KhanApiError) unavailable ??= error;
+      else throw error;
     }
+
+    if (unavailable) throw unavailable;
+    return [];
   }
 
   private buildParentPath(parentTopic?: ParentTopicData): string {
@@ -514,6 +576,8 @@ export class KhanClient {
     const cached = this.cache.get<KhanContent>(cacheKey);
     if (cached !== undefined) return cached;
 
+    let unavailable: KhanApiError | undefined;
+
     try {
       const result = await this.contentForPath(slug);
 
@@ -554,48 +618,49 @@ export class KhanClient {
         this.cache.set(cacheKey, content, CACHE_TTL);
         return content;
       }
-    } catch {
-      // Fall through
+    } catch (error) {
+      if (error instanceof KhanApiError) unavailable = error;
+      else throw error;
     }
 
     // Fallback: scrape
-    return await this.scrapeContentPage(slug);
+    try {
+      const scraped = await this.scrapeContentPage(slug);
+      if (scraped) return scraped;
+    } catch (error) {
+      if (error instanceof KhanApiError) unavailable ??= error;
+      else throw error;
+    }
+
+    if (unavailable) throw unavailable;
+    return null;
   }
 
   private async scrapeContentPage(slug: string): Promise<KhanContent | null> {
-    try {
-      const response = await this.rateLimitedFetch(`https://www.khanacademy.org/${slug}`, {
-        headers: { Accept: "text/html" },
-      });
+    const html = await this.fetchPageHtml(slug);
+    if (html === null) return null;
 
-      if (!response.ok) return null;
+    const titleMatch = html.match(/<title>([^<]+)<\/title>/);
+    const descMatch = html.match(/<meta\s+name="description"\s+content="([^"]+)"/);
+    const youtubeId = extractYouTubeId(html);
+    const ogImageMatch = html.match(/<meta\s+property="og:image"\s+content="([^"]+)"/);
 
-      const html = await response.text();
+    const title = titleMatch?.[1]?.replace(/ \| Khan Academy$/, "").trim() ?? slug;
 
-      const titleMatch = html.match(/<title>([^<]+)<\/title>/);
-      const descMatch = html.match(/<meta\s+name="description"\s+content="([^"]+)"/);
-      const youtubeId = extractYouTubeId(html);
-      const ogImageMatch = html.match(/<meta\s+property="og:image"\s+content="([^"]+)"/);
+    const content: KhanContent = {
+      id: slug,
+      slug,
+      title,
+      kind: detectContentKind(slug),
+      url: buildKAUrl(slug),
+      description: descMatch?.[1] ?? "",
+      thumbnailUrl: ogImageMatch?.[1],
+      youtubeId: youtubeId ?? undefined,
+      kaUrl: buildKAUrl(slug),
+    };
 
-      const title = titleMatch?.[1]?.replace(/ \| Khan Academy$/, "").trim() ?? slug;
-
-      const content: KhanContent = {
-        id: slug,
-        slug,
-        title,
-        kind: detectContentKind(slug),
-        url: buildKAUrl(slug),
-        description: descMatch?.[1] ?? "",
-        thumbnailUrl: ogImageMatch?.[1],
-        youtubeId: youtubeId ?? undefined,
-        kaUrl: buildKAUrl(slug),
-      };
-
-      this.cache.set(`content:${slug}`, content, CACHE_TTL);
-      return content;
-    } catch {
-      return null;
-    }
+    this.cache.set(`content:${slug}`, content, CACHE_TTL);
+    return content;
   }
 
   // ─── get_course ──────────────────────────────────────────────────
@@ -605,6 +670,8 @@ export class KhanClient {
     const cacheKey = `course:${slug}`;
     const cached = this.cache.get<KhanCourse>(cacheKey);
     if (cached !== undefined) return cached;
+
+    let unavailable: KhanApiError | undefined;
 
     try {
       const result = await this.contentForPath(slug);
@@ -621,12 +688,22 @@ export class KhanClient {
         this.cache.set(cacheKey, course, TOPIC_CACHE_TTL);
         return course;
       }
-    } catch {
-      // Fall through
+    } catch (error) {
+      if (error instanceof KhanApiError) unavailable = error;
+      else throw error;
     }
 
     // Fallback: scrape
-    return await this.scrapeCourse(slug);
+    try {
+      const scraped = await this.scrapeCourse(slug);
+      if (scraped) return scraped;
+    } catch (error) {
+      if (error instanceof KhanApiError) unavailable ??= error;
+      else throw error;
+    }
+
+    if (unavailable) throw unavailable;
+    return null;
   }
 
   private mapCourseUnits(course: CourseData): KhanUnit[] {
@@ -670,27 +747,19 @@ export class KhanClient {
   }
 
   private async scrapeCourse(slug: string): Promise<KhanCourse | null> {
-    try {
-      const response = await this.rateLimitedFetch(`https://www.khanacademy.org/${slug}`, {
-        headers: { Accept: "text/html" },
-      });
+    const html = await this.fetchPageHtml(slug);
+    if (html === null) return null;
 
-      if (!response.ok) return null;
+    const titleMatch = html.match(/<title>([^<]+)<\/title>/);
+    const descMatch = html.match(/<meta\s+name="description"\s+content="([^"]+)"/);
 
-      const html = await response.text();
-      const titleMatch = html.match(/<title>([^<]+)<\/title>/);
-      const descMatch = html.match(/<meta\s+name="description"\s+content="([^"]+)"/);
-
-      return {
-        slug,
-        title: titleMatch?.[1]?.replace(/ \| Khan Academy$/, "").trim() ?? slug,
-        description: descMatch?.[1] ?? "",
-        url: buildKAUrl(slug),
-        units: [],
-      };
-    } catch {
-      return null;
-    }
+    return {
+      slug,
+      title: titleMatch?.[1]?.replace(/ \| Khan Academy$/, "").trim() ?? slug,
+      description: descMatch?.[1] ?? "",
+      url: buildKAUrl(slug),
+      units: [],
+    };
   }
 
   // ─── get_article ─────────────────────────────────────────────────
@@ -701,59 +770,63 @@ export class KhanClient {
     const cached = this.cache.get<KhanArticle>(cacheKey);
     if (cached !== undefined) return cached;
 
+    let unavailable: KhanApiError | undefined;
+
+    // Get metadata via ContentForPath
+    let raw: ContentData | null = null;
     try {
-      // Get metadata via ContentForPath
       const result = await this.contentForPath(slug);
-      const raw = result?.content;
+      raw = result?.content ?? null;
+    } catch (error) {
+      if (error instanceof KhanApiError) unavailable = error;
+      else throw error;
+    }
 
-      // Verify it's an article
-      if (!raw || !raw.contentKind?.toLowerCase().includes("article")) {
-        // If not clearly an article, still attempt if slug contains /a/
-        if (!slug.includes("/a/") && !slug.includes("/article/")) {
-          return null;
-        }
-      }
-
-      const title = raw?.translatedTitle ?? slug;
-      const description = raw?.translatedDescription ?? raw?.description ?? "";
-      const authorNames = raw?.authorNames;
-      const dateAdded = raw?.dateAdded;
-      const url = buildKAUrl(raw?.relativeUrl ?? slug);
-
-      // Scrape the page for article content
-      let content = "";
-      try {
-        const response = await this.rateLimitedFetch(`https://www.khanacademy.org/${slug}`, {
-          headers: { Accept: "text/html" },
-        });
-
-        if (response.ok) {
-          const html = await response.text();
-          content = this.extractArticleContent(html);
-        }
-      } catch {
-        // Continue with empty content
-      }
-
-      if (!content && !raw) {
+    // Verify it's an article
+    if (!raw || !raw.contentKind?.toLowerCase().includes("article")) {
+      // If not clearly an article, still attempt if slug contains /a/
+      if (!slug.includes("/a/") && !slug.includes("/article/")) {
+        if (!raw && unavailable) throw unavailable;
         return null;
       }
+    }
 
-      const article: KhanArticle = {
-        slug,
-        title,
-        description,
-        url,
-        content: content || description,
-        authorNames,
-        dateAdded,
-      };
+    const title = raw?.translatedTitle ?? slug;
+    const description = raw?.translatedDescription ?? raw?.description ?? "";
+    const authorNames = raw?.authorNames;
+    const dateAdded = raw?.dateAdded;
+    const url = buildKAUrl(raw?.relativeUrl ?? slug);
 
-      this.cache.set(cacheKey, article, CACHE_TTL);
-      return article;
-    } catch {
+    // Scrape the page for article content
+    let content = "";
+    try {
+      const html = await this.fetchPageHtml(slug);
+      if (html !== null) {
+        content = this.extractArticleContent(html);
+      }
+    } catch (error) {
+      // Metadata may still be enough to return a partial article
+      if (error instanceof KhanApiError) unavailable ??= error;
+      else throw error;
+    }
+
+    if (!content && !raw) {
+      if (unavailable) throw unavailable;
       return null;
     }
+
+    const article: KhanArticle = {
+      slug,
+      title,
+      description,
+      url,
+      content: content || description,
+      authorNames,
+      dateAdded,
+    };
+
+    this.cache.set(cacheKey, article, CACHE_TTL);
+    return article;
   }
 
   private extractArticleContent(html: string): string {
@@ -837,6 +910,8 @@ export class KhanClient {
     const cached = this.cache.get<KhanLessonDetail>(cacheKey);
     if (cached !== undefined) return cached;
 
+    let unavailable: KhanApiError | undefined;
+
     try {
       // Strategy: extract course slug from lesson path, fetch course, find lesson
       // Lesson slugs look like: math/algebra/x2f8bb11595b61c86:foundation-algebra/x2f8bb11595b61c86:intro-to-variables
@@ -884,78 +959,81 @@ export class KhanClient {
         }
       }
 
-      // Fallback: scrape the lesson page directly
-      return await this.scrapeLessonPage(slug);
-    } catch {
-      return null;
+    } catch (error) {
+      if (error instanceof KhanApiError) unavailable = error;
+      else throw error;
     }
+
+    // Fallback: scrape the lesson page directly
+    try {
+      const scraped = await this.scrapeLessonPage(slug);
+      if (scraped) return scraped;
+    } catch (error) {
+      if (error instanceof KhanApiError) unavailable ??= error;
+      else throw error;
+    }
+
+    if (unavailable) throw unavailable;
+    return null;
   }
 
   private async scrapeLessonPage(slug: string): Promise<KhanLessonDetail | null> {
-    try {
-      const response = await this.rateLimitedFetch(`https://www.khanacademy.org/${slug}`, {
-        headers: { Accept: "text/html" },
-      });
+    const html = await this.fetchPageHtml(slug);
+    if (html === null) return null;
 
-      if (!response.ok) return null;
+    const titleMatch = html.match(/<title>([^<]+)<\/title>/);
+    const descMatch = html.match(/<meta\s+name="description"\s+content="([^"]+)"/);
+    const title = titleMatch?.[1]?.replace(/ \| Khan Academy$/, "").trim() ?? slug;
+    const description = descMatch?.[1] ?? "";
 
-      const html = await response.text();
-      const titleMatch = html.match(/<title>([^<]+)<\/title>/);
-      const descMatch = html.match(/<meta\s+name="description"\s+content="([^"]+)"/);
-      const title = titleMatch?.[1]?.replace(/ \| Khan Academy$/, "").trim() ?? slug;
-      const description = descMatch?.[1] ?? "";
+    const contentItems: KhanContentSummary[] = [];
 
-      const contentItems: KhanContentSummary[] = [];
-
-      // Try Apollo state for content items
-      const stateMatch = html.match(/window\.__APOLLO_STATE__\s*=\s*({.+?});?\s*<\/script>/s);
-      if (stateMatch) {
-        try {
-          const state = JSON.parse(stateMatch[1]);
-          for (const [key, value] of Object.entries(state)) {
-            const v = value as Record<string, unknown>;
-            if (
-              v.translatedTitle &&
-              v.contentKind &&
-              typeof v.translatedTitle === "string" &&
-              typeof v.contentKind === "string" &&
-              !key.startsWith("Topic:") &&
-              !key.startsWith("Course:")
-            ) {
-              contentItems.push({
-                slug: (v.slug as string) ?? "",
-                title: v.translatedTitle,
-                kind: (v.contentKind as ContentKind) ?? "Unknown",
-                url: buildKAUrl((v.relativeUrl as string) ?? (v.canonicalUrl as string) ?? ""),
-                description: (v.translatedDescription as string) ?? undefined,
-              });
-            }
+    // Try Apollo state for content items
+    const stateMatch = html.match(/window\.__APOLLO_STATE__\s*=\s*({.+?});?\s*<\/script>/s);
+    if (stateMatch) {
+      try {
+        const state = JSON.parse(stateMatch[1]);
+        for (const [key, value] of Object.entries(state)) {
+          const v = value as Record<string, unknown>;
+          if (
+            v.translatedTitle &&
+            v.contentKind &&
+            typeof v.translatedTitle === "string" &&
+            typeof v.contentKind === "string" &&
+            !key.startsWith("Topic:") &&
+            !key.startsWith("Course:")
+          ) {
+            contentItems.push({
+              slug: (v.slug as string) ?? "",
+              title: v.translatedTitle,
+              kind: (v.contentKind as ContentKind) ?? "Unknown",
+              url: buildKAUrl((v.relativeUrl as string) ?? (v.canonicalUrl as string) ?? ""),
+              description: (v.translatedDescription as string) ?? undefined,
+            });
           }
-        } catch {
-          // Ignore parse errors
         }
+      } catch {
+        // Ignore parse errors
       }
-
-      const videos = contentItems.filter((item) => item.kind === "Video").length;
-      const articles = contentItems.filter((item) => item.kind === "Article").length;
-      const exercises = contentItems.filter((item) => item.kind === "Exercise").length;
-
-      const detail: KhanLessonDetail = {
-        slug,
-        title,
-        description,
-        url: buildKAUrl(slug),
-        contentItems,
-        videos,
-        articles,
-        exercises,
-      };
-
-      this.cache.set(`lesson:${slug}`, detail, CACHE_TTL);
-      return detail;
-    } catch {
-      return null;
     }
+
+    const videos = contentItems.filter((item) => item.kind === "Video").length;
+    const articles = contentItems.filter((item) => item.kind === "Article").length;
+    const exercises = contentItems.filter((item) => item.kind === "Exercise").length;
+
+    const detail: KhanLessonDetail = {
+      slug,
+      title,
+      description,
+      url: buildKAUrl(slug),
+      contentItems,
+      videos,
+      articles,
+      exercises,
+    };
+
+    this.cache.set(`lesson:${slug}`, detail, CACHE_TTL);
+    return detail;
   }
 
   // ─── get_exercise ───────────────────────────────────────────────
@@ -1048,7 +1126,8 @@ export class KhanClient {
 
       this.cache.set(cacheKey, exercise, CACHE_TTL);
       return exercise;
-    } catch {
+    } catch (error) {
+      if (error instanceof KhanApiError) throw error;
       return null;
     }
   }
@@ -1149,7 +1228,8 @@ export class KhanClient {
 
       this.cache.set(cacheKey, quizzes, CACHE_TTL);
       return quizzes;
-    } catch {
+    } catch (error) {
+      if (error instanceof KhanApiError) throw error;
       return [];
     }
   }
@@ -1209,6 +1289,8 @@ export class KhanClient {
       return transcript;
     }
 
+    let unavailable: KhanApiError | undefined;
+
     // Use ContentForPath which returns subtitles directly
     try {
       const result = await this.contentForPath(slug);
@@ -1252,10 +1334,12 @@ export class KhanClient {
           return transcript;
         }
       }
-    } catch {
-      // Fall through
+    } catch (error) {
+      if (error instanceof KhanApiError) unavailable = error;
+      else throw error;
     }
 
+    if (unavailable) throw unavailable;
     return null;
   }
 
@@ -1297,7 +1381,8 @@ export class KhanClient {
 
       const xml = await captionResponse.text();
       return this.parseTranscriptXml(xml, youtubeId, track.languageCode, videoTitle);
-    } catch {
+    } catch (error) {
+      if (error instanceof KhanApiError) throw error;
       return null;
     }
   }

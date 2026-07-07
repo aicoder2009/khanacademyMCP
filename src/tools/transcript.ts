@@ -2,6 +2,7 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { KhanClient } from "../khan-api/client.js";
 import { formatDuration } from "../khan-api/parser.js";
+import { toolErrorResult } from "./errors.js";
 
 export function registerTranscriptTool(server: McpServer, client: KhanClient) {
   server.tool(
@@ -63,15 +64,7 @@ export function registerTranscriptTool(server: McpServer, client: KhanClient) {
           content: [{ type: "text" as const, text }],
         };
       } catch (error) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Error fetching transcript: ${error instanceof Error ? error.message : "Unknown error"}`,
-            },
-          ],
-          isError: true,
-        };
+        return toolErrorResult(error, "fetching the transcript");
       }
     }
   );
