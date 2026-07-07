@@ -13,10 +13,26 @@ import { registerExerciseTool } from "./tools/exercise.js";
 import { registerQuizTool } from "./tools/quiz.js";
 
 const require = createRequire(import.meta.url);
-const packageMetadata = require("../package.json") as {
+
+interface PackageMetadata {
   description?: string;
   version?: string;
-};
+}
+
+// Compiled output lives at different depths (dist/, dist-test/src/), so walk up
+// until we find the package manifest.
+function loadPackageMetadata(): PackageMetadata {
+  for (const relativePath of ["../package.json", "../../package.json", "../../../package.json"]) {
+    try {
+      return require(relativePath) as PackageMetadata;
+    } catch {
+      // Try the next level up
+    }
+  }
+  return {};
+}
+
+const packageMetadata = loadPackageMetadata();
 
 export const SERVER_VERSION = packageMetadata.version ?? "0.4.1";
 
@@ -40,7 +56,7 @@ export const SERVER_INSTRUCTIONS = `You are connected to the Khan Academy MCP se
 ## Available Tools
 
 ### Discovery & Search
-- **search** — Search Khan Academy for videos, articles, exercises, and courses. Start here when a user asks about any topic. Pass a descriptive query and an optional limit (default 10, max 30).
+- **search** — Search Khan Academy for videos, articles, exercises, and courses. Start here when a user asks about any topic. Pass a descriptive query, an optional limit (default 10, max 30), and an optional kind filter ('video', 'article', or 'exercise') to narrow results to one content type.
 - **list_subjects** — List all top-level Khan Academy subjects and popular courses. Use this when a user wants to browse what is available or needs a starting point.
 
 ### Browsing & Navigation

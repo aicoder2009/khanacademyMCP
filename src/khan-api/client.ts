@@ -68,24 +68,36 @@ const STATIC_SUBJECTS: KhanSubject[] = [
 export class KhanClient {
   private cache: TTLCache;
   private lastRequestTime = 0;
+  private throttleChain: Promise<void> = Promise.resolve();
 
   constructor() {
     this.cache = new TTLCache(CACHE_TTL);
   }
 
-  /** Rate-limited fetch with exponential backoff on 429. */
-  private async rateLimitedFetch(url: string, options?: RequestInit): Promise<Response> {
-    const now = Date.now();
-    const timeSinceLast = now - this.lastRequestTime;
-    if (timeSinceLast < MIN_REQUEST_INTERVAL) {
-      await new Promise((resolve) => setTimeout(resolve, MIN_REQUEST_INTERVAL - timeSinceLast));
-    }
-    this.lastRequestTime = Date.now();
+  /**
+   * Wait for a request slot. Slots are handed out through a promise chain so
+   * concurrent tool calls are serialized instead of racing past the interval check.
+   */
+  private acquireSlot(): Promise<void> {
+    const slot = this.throttleChain.then(async () => {
+      const waitMs = this.lastRequestTime + MIN_REQUEST_INTERVAL - Date.now();
+      if (waitMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+      }
+      this.lastRequestTime = Date.now();
+    });
+    this.throttleChain = slot.catch(() => {});
+    return slot;
+  }
 
+  /** Rate-limited fetch with exponential backoff on 429/503. */
+  private async rateLimitedFetch(url: string, options?: RequestInit): Promise<Response> {
     let retries = 0;
     const maxRetries = 3;
 
     while (retries <= maxRetries) {
+      await this.acquireSlot();
+
       let response: Response;
       try {
         response = await fetch(url, {
@@ -97,9 +109,12 @@ export class KhanClient {
         throw new Error(`Request to ${url} failed: ${message}`, { cause: error });
       }
 
-      if (response.status === 429 && retries < maxRetries) {
+      if ((response.status === 429 || response.status === 503) && retries < maxRetries) {
         retries++;
-        const backoff = Math.pow(2, retries) * 1000;
+        const retryAfterSeconds = Number(response.headers.get("retry-after"));
+        const backoff = Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
+          ? Math.min(retryAfterSeconds * 1000, 30_000)
+          : Math.pow(2, retries) * 1000;
         await new Promise((resolve) => setTimeout(resolve, backoff));
         continue;
       }

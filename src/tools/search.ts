@@ -8,19 +8,26 @@ export function registerSearchTool(server: McpServer, client: KhanClient) {
     "Search Khan Academy's library for videos, articles, exercises, and courses by keyword. Returns titles, types, parent topic paths, and URLs. Use this when looking for specific content or topics.",
     {
       query: z.string().describe("Search query (e.g., 'photosynthesis', 'quadratic formula', 'intro to python')"),
-      limit: z.number().min(1).max(30).default(10).describe("Maximum number of results to return (default: 10)"),
+      limit: z.number().int().min(1).max(30).default(10).describe("Maximum number of results to return (default: 10)"),
+      kind: z.enum(["all", "video", "article", "exercise"]).default("all").describe("Filter results by content type (default: 'all')"),
     },
     { title: "Search Khan Academy", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-    async ({ query, limit }) => {
+    async ({ query, limit, kind }) => {
       try {
-        const results = await client.search(query, limit);
+        // Over-fetch when filtering by kind so the filtered list can still fill the limit
+        const fetchLimit = kind === "all" ? limit : Math.min(limit * 3, 30);
+        let results = await client.search(query, fetchLimit);
+        if (kind !== "all") {
+          results = results.filter((r) => r.kind.toLowerCase() === kind).slice(0, limit);
+        }
 
         if (results.length === 0) {
+          const kindNote = kind === "all" ? "" : ` of type "${kind}"`;
           return {
             content: [
               {
                 type: "text" as const,
-                text: `No results found for "${query}". Try a different search term or check the spelling.`,
+                text: `No results found for "${query}"${kindNote}. Try a different search term${kind === "all" ? "" : ", or retry with kind: 'all'"}.`,
               },
             ],
           };

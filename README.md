@@ -57,6 +57,7 @@ Add this to your Claude Desktop config (`~/Library/Application Support/Claude/cl
 ```
 query: string    — Search query (e.g., "photosynthesis", "quadratic formula")
 limit?: number   — Max results (1-30, default: 10)
+kind?: string    — "all", "video", "article", or "exercise" (default: "all")
 ```
 
 #### `list_subjects`

@@ -5,10 +5,19 @@ import { createRequire } from "node:module";
 import { createServer, registerAllTools, SERVER_INFO, SERVER_VERSION } from "../src/server.js";
 
 const require = createRequire(import.meta.url);
-const packageJson = require("../package.json") as {
-  description: string;
-  version: string;
-};
+
+function loadPackageJson(): { description: string; version: string } {
+  for (const relativePath of ["../package.json", "../../package.json"]) {
+    try {
+      return require(relativePath) as { description: string; version: string };
+    } catch {
+      // Try the next level up
+    }
+  }
+  throw new Error("package.json not found");
+}
+
+const packageJson = loadPackageJson();
 
 test("server metadata stays aligned with package metadata", () => {
   assert.equal(SERVER_VERSION, packageJson.version);
